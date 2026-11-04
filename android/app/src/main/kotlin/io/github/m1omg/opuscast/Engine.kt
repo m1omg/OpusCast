@@ -102,8 +102,17 @@ private class NextUp(val video: Video, val startAt: Double, val subtitle: Pair<S
 private class Session(
     val kind: Kind, val video: Video, val media: Media, val next: NextUp?, val started: Double, val gen: Int,
     var found: FoundSubs?, var subEntry: SubtitleEntry?, var subLoading: Boolean,
+    val startAt: Double, val subsOn: Boolean,
 ) {
     var seenPlaying = false
+    /** Starting it on the TV failed, but the TV may still play it: a Samsung asks "Allow this device?"
+     *  the first time, holds the phone's commands meanwhile and carries them out once allowed. */
+    var startError: Exception? = null
+    var startFailedAt = 0.0
+    /** When the TV began answering again after the failure (0 = not yet). */
+    var answeringSince = 0.0
+    var retried = false
+    var waitBanner = 0
     var subs: MutableList<SubtitleEntry>? = found?.entries?.toMutableList()
     var subOn = false
     var subTvChanged = false
@@ -153,6 +162,7 @@ class Engine(private val app: Context) {
     private var scannedAt = 0.0
     private var pendingPlay: Pair<Video, Double?>? = null
     private var eventSids = mapOf<String, String>()
+    private var eventsPending = false // a SUBSCRIBE is on its way
     private var lastCaptionEvent = 0.0
     private var lastCaptionCmd = 0.0
     private var renewTask: Runnable? = null
@@ -406,6 +416,7 @@ class Engine(private val app: Context) {
     }
 
     private fun subscribeEvents(t: Tv) {
+        eventsPending = true
         submit({
             val sids = HashMap<String, String>()
             var timeout = 1800
@@ -423,6 +434,7 @@ class Engine(private val app: Context) {
     }
 
     private fun eventsReady(t: Tv, sids: Map<String, String>, timeout: Int) {
+        eventsPending = false
         if (t === tv) {
             eventSids = sids
             if (sids.isNotEmpty()) scheduleRenew(timeout)
@@ -697,7 +709,7 @@ class Engine(private val app: Context) {
         val entry = subtitle?.first
         val media = server.publish(source ?: DocSource(app, video), subtitle?.second)
         val start = now()
-        val s = Session(kind, video, media, next, start, gen, found, entry, entry != null && subsOn)
+        val s = Session(kind, video, media, next, start, gen, found, entry, entry != null && subsOn, startAt, subsOn)
         if (entry != null) s.paths[entry.id] = media.subPath!!
         session = s
         poller.active = true
@@ -711,7 +723,8 @@ class Engine(private val app: Context) {
         if (settings.preview) previewLoad()
         val g = gen
         if (subsOn) lastCaptionCmd = start
-        submit({ playMedia(t, server, media, startAt, subsOn = subsOn) }) { result -> playStarted(g, result) }
+        if (eventSids.isEmpty() && !eventsPending) subscribeEvents(t) // e.g. the TV didn't answer until it was allowed
+        startOnTv(s)
         main.postDelayed({ checkFetched(g) }, 15_000)
         if (kind == Kind.MOVIE && found == null) {
             thread(isDaemon = true, name = "opuscast-subs") {
@@ -727,10 +740,28 @@ class Engine(private val app: Context) {
         updateStatus()
     }
 
-    private fun playStarted(g: Int, captions: String?) {
+    /** Hand the session's video to the TV (stop, set, play, resume point, subtitle). */
+    private fun startOnTv(s: Session) {
+        val t = tv ?: return
+        val g = s.gen
+        worker.execute {
+            val r = runCatching { playMedia(t, server, s.media, s.startAt, subsOn = s.subsOn) }
+            main.post { playStarted(g, r) }
+        }
+    }
+
+    private fun playStarted(g: Int, result: Result<String?>) {
         poller.wake()
         val s = session
-        if (s == null || s.gen != g || s.subEntry == null) return
+        if (s == null || s.gen != g) return
+        val error = result.exceptionOrNull()
+        if (error != null) {
+            startFailed(s, error as? Exception ?: RuntimeException(error))
+            return
+        }
+        s.startError = null // (a retry worked)
+        val captions = result.getOrNull()
+        if (s.subEntry == null) return
         s.subLoading = false
         lastCaptionCmd = now()
         when (captions) {
@@ -738,6 +769,70 @@ class Engine(private val app: Context) {
             "unsupported" -> { s.subOn = true; s.captionApi = false } // sent with the video; the TV decides
         }
         updateStatus()
+    }
+
+    /** The start commands failed. Keep the session: the TV may be waiting for "Allow" and play it then. */
+    private fun startFailed(s: Session, e: Exception) {
+        s.subLoading = false
+        if (s.seenPlaying) { // it plays anyway
+            showInfo(str(R.string.tv_didnt_accept, errorText(e)), Banner.Kind.WARNING)
+            updateStatus()
+            return
+        }
+        s.startError = e
+        s.startFailedAt = now()
+        s.answeringSince = 0.0
+        showInfo(str(R.string.tv_waiting_allow, errorText(e)), Banner.Kind.WARNING, listOf(
+            BannerAction(str(R.string.try_again)) { retryStart() },
+            BannerAction(str(R.string.stop)) { stop() },
+        ))
+        s.waitBanner = bannerId
+        val g = s.gen
+        val stamp = s.startFailedAt
+        main.postDelayed({ giveUp(g, stamp) }, 120_000)
+        updateStatus()
+    }
+
+    /** Send the start commands again, in the same session (same address for the TV). */
+    private fun retryStart() {
+        val s = session ?: return
+        if (s.seenPlaying) return
+        s.retried = true
+        if (banner?.id == s.waitBanner) banner = null
+        s.subLoading = s.subEntry != null && s.subsOn
+        tv?.let { if (eventSids.isEmpty() && !eventsPending) subscribeEvents(it) }
+        startOnTv(s)
+        updateStatus()
+    }
+
+    private fun giveUp(g: Int, stamp: Double) {
+        val s = session ?: return
+        val e = s.startError ?: return
+        if (s.gen != g || s.seenPlaying || s.startFailedAt != stamp) return
+        endSession(stopTv = false)
+        showInfo(str(R.string.couldnt_start, errorText(e)), Banner.Kind.ERROR)
+    }
+
+    /** The TV plays it after all (allowed on the TV): carry on as if the start had worked. */
+    private fun recovered(s: Session) {
+        s.startError = null
+        if (banner?.id == s.waitBanner) banner = null
+        val t = tv ?: return
+        if (s.startAt > 1) { // the resume point was never sent
+            hold = Hold(s.startAt, now(), 30.0)
+            submit({ t.seek(s.startAt) }) { poller.wake() }
+        }
+        val entry = s.subEntry
+        if (s.kind == Kind.MOVIE && entry != null && s.subsOn && !s.subOn) {
+            lastCaptionCmd = now()
+            submit({ showSubtitle(t, server, s.media, s.media.subPath) }) { r ->
+                if (s === session) {
+                    s.captionApi = r == "ok"
+                    s.subOn = true // announced with the video either way
+                    updateStatus()
+                }
+            }
+        }
     }
 
     private fun subsFound(g: Int, found: FoundSubs) {
@@ -790,7 +885,7 @@ class Engine(private val app: Context) {
 
     private fun checkFetched(g: Int) {
         val s = session ?: return
-        if (s.gen == g && !s.media.requested) {
+        if (s.gen == g && !s.media.requested && s.startError == null) {
             showInfo(str(R.string.not_loading), Banner.Kind.WARNING, listOf(BannerAction(str(R.string.try_again)) {
                 val cur = session ?: return@BannerAction
                 if (cur.kind == Kind.MOVIE) play(cur.video, estPos()) else skipIntro()
@@ -811,6 +906,7 @@ class Engine(private val app: Context) {
         val err = r.error
         if (err != null) {
             pollErrors += 1
+            session?.let { it.answeringSince = 0.0 }
             if (pollErrors == 3) setStatusLine(str(R.string.cant_reach, t.name))
             return
         }
@@ -826,6 +922,7 @@ class Engine(private val app: Context) {
         val pos = r.pos
         val ours = r.uri.isNullOrEmpty() || s.media.urlPath in r.uri!!
         val n = now()
+        val wasSeen = s.seenPlaying
         if (ours) {
             if (state == "PLAYING") s.seenPlaying = true
             if (s.seenPlaying && state in setOf("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING")) {
@@ -848,7 +945,13 @@ class Engine(private val app: Context) {
             sessionFinished()
             return
         }
-        if (!s.seenPlaying && n - s.started > 40 && (state == "STOPPED" || state == "NO_MEDIA_PRESENT")) {
+        if (!wasSeen && s.seenPlaying && s.startError != null) recovered(s)
+        if (!s.seenPlaying && s.startError != null) {
+            // the TV answers again (allowed?): if it doesn't start the video by itself, send it once more
+            if (s.answeringSince == 0.0) s.answeringSince = n
+            if (!s.retried && n - s.answeringSince >= 4) retryStart()
+        }
+        if (!s.seenPlaying && s.startError == null && n - s.started > 40 && (state == "STOPPED" || state == "NO_MEDIA_PRESENT")) {
             endSession(stopTv = false)
             showInfo(str(R.string.tv_didnt_start), Banner.Kind.ERROR)
             return
@@ -867,6 +970,7 @@ class Engine(private val app: Context) {
             else -> str(R.string.starting_on_tv)
         }
         if (s.kind == Kind.INTRO && st == "PLAYING") text = str(R.string.skynet_online)
+        if (!s.seenPlaying && s.startError != null) text = str(R.string.waiting_tv)
         if (s.subLoading) text = str(R.string.loading_subtitles)
         val name = tv?.name
         playerStatus = if (name != null) str(R.string.status_on, text, name) else text

@@ -59,6 +59,8 @@
     <string name="tv_didnt_start">The TV didn\'t start the video. It may not support this file\'s format (Dolby Vision files often don\'t work on Samsung TVs).</string>
     <string name="not_loading">The TV hasn\'t started loading the video. Make sure the phone and the TV are on the same Wi-Fi network - guest networks and some routers keep devices apart. A VPN on the phone can get in the way too.</string>
     <string name="try_again">Try again</string>
+    <string name="tv_waiting_allow">The TV hasn\'t taken the video yet (%1$s). If the TV asks whether to allow this phone, choose Allow - the video then starts by itself.</string>
+    <string name="waiting_tv">Waiting for the TV…</string>
     <string name="cant_read_file">Can\'t read that file: %1$s</string>
     <string name="cant_open_anymore">OpusCast can\'t open this video any more. Choose it again.</string>
     <string name="couldnt_start">Couldn\'t start the video on the TV: %1$s</string>

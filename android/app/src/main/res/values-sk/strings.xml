@@ -58,6 +58,8 @@
     <string name="tv_didnt_start">Televízor video nespustil. Možno nepodporuje formát tohto súboru (súbory s Dolby Vision v televízoroch Samsung často nefungujú).</string>
     <string name="not_loading">Televízor nezačal načítavať video. Skontrolujte, či sú telefón aj televízor v rovnakej Wi‑Fi sieti – hosťovské siete a niektoré routery zariadenia oddeľujú. Prekážať môže aj VPN v telefóne.</string>
     <string name="try_again">Skúsiť znova</string>
+    <string name="tv_waiting_allow">Televízor video zatiaľ neprevzal (%1$s). Ak sa televízor pýta, či povoliť tento telefón, zvoľte Povoliť – video sa potom spustí samo.</string>
+    <string name="waiting_tv">Čakám na televízor…</string>
     <string name="cant_read_file">Súbor sa nedá prečítať: %1$s</string>
     <string name="cant_open_anymore">OpusCast už toto video nevie otvoriť. Vyberte ho znova.</string>
     <string name="couldnt_start">Video sa v televízore nepodarilo spustiť: %1$s</string>

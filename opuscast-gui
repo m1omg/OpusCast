@@ -241,6 +241,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.devices, self.scanning, self.scanned_at = [], False, 0.0
         self.pending_play = None
         self.event_sids, self.last_caption_event, self.last_caption_cmd = {}, 0.0, 0.0
+        self.events_pending = False  # a SUBSCRIBE is on its way
         self.worker = Worker(self._on_worker_error)
         self.preview = Preview(self._on_preview_error, self._swap_preview_widget)
         self._build_ui()
@@ -538,6 +539,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         bar.connect("response", respond)
         self.info_box.pack_start(bar, False, False, 0)
         bar.show_all()
+        return bar
 
     def clear_info(self):
         for child in self.info_box.get_children():
@@ -589,6 +591,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self.play_file(*args)
 
     def _subscribe_events(self, tv):
+        self.events_pending = True
+
         def work():
             sids = {}
             for service in ("AVTransport", "RenderingControl"):
@@ -600,6 +604,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.worker.submit(work, done=lambda sids: self._events_ready(tv, sids))
 
     def _events_ready(self, tv, sids):
+        self.events_pending = False
         if tv is self.tv:
             self.event_sids = sids
         else:
@@ -959,7 +964,12 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.session = {"kind": kind, "path": path, "media": media, "next": next_up, "seen_playing": False,
                         "started": now, "gen": self.gen, "subs": subs, "sub_entry": entry, "sub_on": False,
                         "sub_tv_changed": False, "caption_api": None, "sub_loading": bool(entry and subs_on),
-                        "paths": {entry["id"]: media["sub_path"]} if entry else {}}
+                        "paths": {entry["id"]: media["sub_path"]} if entry else {},
+                        "start_at": start_at, "subs_on": subs_on,
+                        # starting it failed, but the TV may still play it: a Samsung asks "Allow this
+                        # device?" the first time, holds the commands meanwhile and carries them out once allowed
+                        "start_error": None, "start_failed": 0.0, "answering_since": 0.0, "retried": False,
+                        "wait_bar": None}
         self.poller.active = True
         self.tv_state, self.tv_pos, self.tv_pos_raw, self.pos_seen, self.tv_dur = "TRANSITIONING", float(start_at), None, now, 0.0
         self.hold = (float(start_at), now, 30.0) if start_at else None
@@ -972,8 +982,9 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         gen = self.gen
         if subs_on:
             self.last_caption_cmd = now
-        self.worker.submit(core.play_media, self.tv, self.server, media, start_at, subs_on=subs_on,
-                           done=lambda result: self._play_started(gen, result))
+        if not self.event_sids and not self.events_pending:  # e.g. the TV didn't answer until it was allowed
+            self._subscribe_events(self.tv)
+        self._start_on_tv(self.session)
         GLib.timeout_add_seconds(15, self._check_fetched, gen)
         if kind == "movie" and subs is None:
             def find():
@@ -985,10 +996,27 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self.show_info(_("Carrying on from {pos}.").format(pos=fmt(start_at)), INFO,
                            [(_("Start from the beginning"), lambda: self.seek_to(0))])
 
-    def _play_started(self, gen, captions):
+    def _start_on_tv(self, s):
+        """Hand the session's video to the TV (stop, set, play, resume point, subtitle)."""
+        tv, gen = self.tv, s["gen"]
+
+        def work():
+            try:
+                return core.play_media(tv, self.server, s["media"], s["start_at"], subs_on=s["subs_on"]), None
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                return None, e
+        self.worker.submit(work, done=lambda r: self._play_started(gen, *r))
+
+    def _play_started(self, gen, captions, error=None):
         self.poller.wake.set()
         s = self.session
-        if not (s and s["gen"] == gen and s["sub_entry"]):
+        if not (s and s["gen"] == gen):
+            return
+        if error is not None:
+            self._start_failed(s, error)
+            return
+        s["start_error"] = None  # (a retry worked)
+        if not s["sub_entry"]:
             return
         s["sub_loading"] = False
         self.last_caption_cmd = time.monotonic()
@@ -997,6 +1025,69 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         elif captions == "unsupported":
             s["sub_on"], s["caption_api"] = True, False  # sent with the video; the TV decides
         self._update_sub_button()
+
+    def _start_failed(self, s, error):
+        """The start commands failed. Keep the session: the TV may be waiting for "Allow" and play it then."""
+        s["sub_loading"] = False
+        if s["seen_playing"]:  # it plays anyway
+            self.show_info(_("The TV didn't accept that: {error}").format(error=error), WARNING)
+            self._update_sub_button()
+            self._update_status()
+            return
+        s["start_error"], s["start_failed"], s["answering_since"] = error, time.monotonic(), 0.0
+        s["wait_bar"] = self.show_info(
+            _("The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
+              "choose Allow - the video then starts by itself.").format(error=error), WARNING,
+            [(_("Try again"), self._retry_start), (_("Stop"), self.stop)])
+        GLib.timeout_add_seconds(120, self._give_up, s["gen"], s["start_failed"])
+        self._update_sub_button()
+        self._update_status()
+
+    def _retry_start(self):
+        """Send the start commands again, in the same session (same address for the TV)."""
+        s = self.session
+        if not s or s["seen_playing"]:
+            return
+        s["retried"] = True
+        self._drop_bar(s["wait_bar"])
+        s["sub_loading"] = bool(s["sub_entry"] and s["subs_on"])
+        if not self.event_sids and not self.events_pending and self.tv:
+            self._subscribe_events(self.tv)
+        self._start_on_tv(s)
+        self._update_sub_button()
+        self._update_status()
+
+    def _give_up(self, gen, stamp):
+        s = self.session
+        if (s and s["gen"] == gen and not s["seen_playing"] and s["start_error"] is not None
+                and s["start_failed"] == stamp):
+            error = s["start_error"]
+            self._end_session(stop_tv=False)
+            self.show_info(_("Couldn't start the video on the TV: {error}").format(error=error), ERROR)
+        return False
+
+    @staticmethod
+    def _drop_bar(bar):
+        if bar is not None and bar.get_parent() is not None:
+            bar.destroy()
+
+    def _recovered(self, s):
+        """The TV plays it after all (allowed on the TV): carry on as if the start had worked."""
+        s["start_error"] = None
+        self._drop_bar(s["wait_bar"])
+        tv = self.tv
+        if s["start_at"] > 1:  # the resume point was never sent
+            self.hold = (float(s["start_at"]), time.monotonic(), 30.0)
+            self.worker.submit(tv.seek, s["start_at"], done=lambda _r: self.poller.wake.set())
+        if s["kind"] == "movie" and s["sub_entry"] and s["subs_on"] and not s["sub_on"]:
+            self.last_caption_cmd = time.monotonic()
+
+            def done(result, sess=s):
+                if sess is self.session:
+                    sess["caption_api"] = result == "ok"
+                    sess["sub_on"] = True  # announced with the video either way
+                    self._update_sub_button()
+            self.worker.submit(core.show_subtitle, tv, self.server, s["media"], s["media"]["sub_path"], done=done)
 
     def _subs_found(self, gen, found):
         s = self.session
@@ -1018,7 +1109,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
 
     def _check_fetched(self, gen):
         s = self.session
-        if s and s["gen"] == gen and not s["media"]["requested"].is_set():
+        if s and s["gen"] == gen and not s["media"]["requested"].is_set() and s["start_error"] is None:
             self._firewall_help()
         return False
 
@@ -1073,6 +1164,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             return False
         if "error" in r:
             self.poll_errors += 1
+            if self.session:
+                self.session["answering_since"] = 0.0
             if self.poll_errors >= 3:
                 self._set_subtitle(_("Can't reach {tv} - is it on?").format(tv=self.tv.name))
             return False
@@ -1089,6 +1182,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         state, pos, dur, uri = r["state"], r["pos"], r["dur"], r["uri"]
         ours = not uri or s["media"]["url_path"] in uri
         now = time.monotonic()
+        was_seen = s["seen_playing"]
         if ours:
             if state == "PLAYING":
                 s["seen_playing"] = True
@@ -1108,7 +1202,16 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         if s["seen_playing"] and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
             self._session_finished()
             return False
-        if not s["seen_playing"] and now - s["started"] > 40 and state in ("STOPPED", "NO_MEDIA_PRESENT"):
+        if not was_seen and s["seen_playing"] and s["start_error"] is not None:
+            self._recovered(s)
+        if not s["seen_playing"] and s["start_error"] is not None:
+            # the TV answers again (allowed?): if it doesn't start the video by itself, send it once more
+            if not s["answering_since"]:
+                s["answering_since"] = now
+            if not s["retried"] and now - s["answering_since"] >= 4:
+                self._retry_start()
+        if (not s["seen_playing"] and s["start_error"] is None and now - s["started"] > 40
+                and state in ("STOPPED", "NO_MEDIA_PRESENT")):
             self._end_session(stop_tv=False)
             self.show_info(_("The TV didn't start the video. It may not support this file's format "
                              "(Dolby Vision files often don't work on Samsung TVs)."), ERROR)
@@ -1126,6 +1229,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             st, _("Starting on the TV…"))
         if s["kind"] == "intro" and st == "PLAYING":
             text = _("Skynet is coming online")
+        if not s["seen_playing"] and s["start_error"] is not None:
+            text = _("Waiting for the TV…")
         if s.get("sub_loading"):
             text = _("Loading subtitles…")
         self._set_text(self.status_label, f"{text} - {self.tv.name}" if self.tv else text)
