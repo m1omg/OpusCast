@@ -29,13 +29,17 @@ from the network should work.
 
 ## Install
 
-Download the APK from the latest **Android** run under the repository's
-[Actions](https://github.com/m1omg/OpusCast/actions/workflows/android.yml) tab (artifact *OpusCast-android*), unzip it, and
-open the `.apk` on the phone. Android asks you to allow installing apps from your browser or file
-manager.
+Download `OpusCast-vX.Y.apk` from the [latest release](https://github.com/m1omg/OpusCast/releases/latest)
+and open it on the phone. Android asks you to allow installing apps from your browser or file manager.
+Builds of every change are also under [Actions](https://github.com/m1omg/OpusCast/actions/workflows/android.yml)
+(artifact *OpusCast-android*, a zip with the APK).
 
-Builds signed with the CI runner's throwaway key can't update each other: uninstall the old version
-first, or set up your own signing key (see the comments in `.github/workflows/android.yml`).
+Until the repository has its own signing key (see the comments in `.github/workflows/android.yml`),
+each build is signed with a throwaway key, so a newer APK won't install over an older one: uninstall
+the old version first.
+
+To publish a new release: raise `versionCode` / `versionName` in `app/build.gradle.kts`, then push a
+version tag whose message is the release notes, e.g. `git tag -a v1.1 -m "…" && git push origin v1.1`.
 
 ## Subtitle files next to the video
 
