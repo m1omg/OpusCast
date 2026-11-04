@@ -20,6 +20,8 @@ pause, rewind and volume all work as usual.
 Tested with a Samsung QLED (Tizen). Most smart TVs that can play videos from the network
 (Samsung, LG, Sony, Philips, Hisense, Android TV with a DLNA app, …) should work.
 
+**Android:** there's an Android version too, in [android/](android/README.md).
+
 ## Install
 
 ```sh

@@ -24,12 +24,33 @@ def states():
             "TRANSITIONING": _("loading"), "NO_MEDIA_PRESENT": _("idle"), "UNREACHABLE": _("not responding")}
 
 
+def start(tv, server, path, start_at=0, subtitle=None):
+    """Publish and start a video. If the start commands fail, the TV may still play it (a Samsung asks
+    "Allow this device?" the first time and carries the commands out once allowed): say so and go on."""
+    media = server.publish(os.path.abspath(path), subtitle)
+    try:
+        media["captions"] = core.play_media(tv, server, media, start_at, subs_on=subtitle is not None)
+        media["start_error"] = None
+    except core.TVError as e:
+        media["start_error"] = e
+        print(_("The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
+                "choose Allow - the video then starts by itself.").format(error=e))
+    media["start_at"], media["subtitle"] = start_at, subtitle
+    return media
+
+
 def wait_until_done(tv, server, media):
-    seen, last, start, warned = False, None, time.time(), False
+    """Follow the TV until the video ends. Returns False if it never started."""
+    seen, last, start_time, warned = False, None, time.time(), False
+    answering, retried = None, False
     names = states()
     while True:
         time.sleep(1)
-        if not media["requested"].is_set() and not warned and time.time() - start > 15:
+        if media.get("start_error") is not None and not seen and time.time() - start_time > 120:
+            print(_("Couldn't start the video on the TV: {error}").format(error=media["start_error"]))
+            return False
+        if (not media["requested"].is_set() and not warned and time.time() - start_time > 15
+                and media.get("start_error") is None):
             warned = True
             print(_("The TV hasn't loaded the video yet - a firewall on this PC may be blocking it.") + "\n"
                   f"  ufw:       sudo ufw allow from {tv.host} to any port {server.port} proto tcp\n"
@@ -38,16 +59,30 @@ def wait_until_done(tv, server, media):
         try:
             state = tv.state()
             uri = tv.position()[2]
+            answering = answering or time.time()
         except core.TVError:
-            state, uri = "UNREACHABLE", None
+            state, uri, answering = "UNREACHABLE", None, None
         ours = not uri or media["url_path"] in uri
+        if media.get("start_error") is not None and not seen and not retried and answering \
+                and time.time() - answering >= 4 and not (state == "PLAYING" and ours):
+            retried = True  # the TV answers again but didn't start it by itself: send it once more
+            try:
+                media["captions"] = core.play_media(tv, server, media, media["start_at"],
+                                                    subs_on=media["subtitle"] is not None)
+            except core.TVError:
+                pass
         if state != last:
             print(_("TV:"), names.get(state, state.lower()))
             last = state
         if state == "PLAYING" and ours:
+            if not seen and media.get("start_error") is not None and media["start_at"] > 1:
+                try:  # the resume point was never sent
+                    tv.seek(media["start_at"])
+                except core.TVError:
+                    pass
             seen = True
         elif seen and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
-            return
+            return True
 
 
 def parse_start(text):
@@ -143,11 +178,12 @@ def main():
         if a.intro:
             import opuscast_intro
             print(_("Skynet is booting…"))
-            wait_until_done(tv, server, core.start_playback(tv, server, opuscast_intro.ensure_intro()))
-        media = core.start_playback(tv, server, a.file, start_at, subtitle=subtitle, subs_on=subtitle is not None)
+            wait_until_done(tv, server, start(tv, server, opuscast_intro.ensure_intro()))
+        media = start(tv, server, a.file, start_at, subtitle=subtitle)
         print(_("Playing on {tv}: {title}").format(tv=tv.name, title=media["title"]))
         print(_("(keep this open while you watch - Ctrl+C stops)"))
-        wait_until_done(tv, server, media)
+        if not wait_until_done(tv, server, media):
+            sys.exit(1)
         print(_("Finished."))
     except KeyboardInterrupt:
         try:

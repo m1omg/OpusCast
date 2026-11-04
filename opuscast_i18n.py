@@ -164,6 +164,12 @@ SK = {
     "Couldn't start the video on the TV: {error}": "Video sa v televízore nepodarilo spustiť: {error}",
     "The TV didn't accept that: {error}": "Televízor to neprijal: {error}",
     "Search again": "Hľadať znova",
+    "Try again": "Skúsiť znova",
+    "Waiting for the TV…": "Čakám na televízor…",
+    "The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
+    "choose Allow - the video then starts by itself.":
+        "Televízor video zatiaľ neprevzal ({error}). Ak sa televízor pýta, či povoliť tento počítač, "
+        "zvoľte Povoliť – video sa potom spustí samo.",
     "Show devices": "Zobraziť zariadenia",
     "In use": "Používa sa",
     "Use this TV": "Použiť tento televízor",
