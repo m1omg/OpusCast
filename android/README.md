@@ -38,8 +38,10 @@ Until the repository has its own signing key (see the comments in `.github/workf
 each build is signed with a throwaway key, so a newer APK won't install over an older one: uninstall
 the old version first.
 
-To publish a new release: raise `versionCode` / `versionName` in `app/build.gradle.kts`, then push a
-version tag whose message is the release notes, e.g. `git tag -a v1.1 -m "…" && git push origin v1.1`.
+To publish a new release, raise `versionCode` / `versionName` in `app/build.gradle.kts`, then either
+draft a release on GitHub (*Releases → Draft a new release*, new tag `v1.1` on `main`) or push a version
+tag whose message is the release notes (`git tag -a v1.1 -m "…" && git push origin v1.1`). Either way CI
+builds the APK and attaches it to the release.
 
 ## Subtitle files next to the video
 
