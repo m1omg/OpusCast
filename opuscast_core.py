@@ -873,6 +873,8 @@ class MediaServer:
             "url_path": f"/media/{token}{ext if ext in MIME else '.mp4'}",
             "sub_path": None, "blank_path": f"/media/{token}-off.srt", "subs": {},
             "requested": threading.Event(),
+            # subtitle commands: a counter so a pending resend knows it's out of date, when the last went out
+            "caption_lock": threading.Lock(), "caption_seq": 0, "caption_sent": 0.0,
         }
         media["subs"][media["blank_path"]] = BLANK_SRT
         if subtitle is not None:
@@ -910,9 +912,59 @@ def show_subtitle(tv, server, media, path=None):
     subtitles together with the video (then restart playback with the subtitle announced)."""
     if not tv.can_switch_subtitles():
         return "unsupported"
+    with media["caption_lock"]:
+        media["caption_seq"] += 1
+        _send_caption(tv, server, media, path)
+    return "ok"
+
+
+def _send_caption(tv, server, media, path):
     tv.show_caption(server.url(media, tv.host), server.url_for(tv.host, path or media["blank_path"]),
                     media["title"])
-    return "ok"
+    media["caption_sent"] = time.monotonic()
+
+
+def _reshow_when_playing(tv, server, media, seq, start_at, seen):
+    """Send the start-up subtitle again once the video really plays.
+
+    Switched on while the video is still starting or seeking to the resume point, a Samsung player
+    can list the subtitle as on without drawing it (another Samsung caster saw the same). The same
+    command a little later shows it. Gives up when the subtitle is changed from the PC, the video
+    stops or another one plays."""
+    floor = max(0.0, start_at - 15)  # seeks land on a keyframe, which can be a little earlier
+    last, steady, deadline = None, 0, time.time() + 300
+    while True:
+        time.sleep(1)
+        if media["caption_seq"] != seq or server.httpd.media is not media or time.time() > deadline:
+            return
+        try:
+            state = tv.state()
+            pos, _dur, uri = tv.position()
+        except TVError:
+            last = None
+            continue
+        if uri and media["url_path"] not in uri:
+            return  # another video is on
+        if state != "PLAYING":
+            if seen and state in ("STOPPED", "NO_MEDIA_PRESENT"):
+                return
+            last = None
+            continue
+        seen = True
+        if pos is not None and last is not None and pos > last:
+            steady += 1
+            if pos >= floor or steady >= 15:  # past the resume point (or it never got there)
+                break
+        last = pos
+    for pause in (1, 4):
+        time.sleep(pause)
+        with media["caption_lock"]:
+            if media["caption_seq"] != seq or server.httpd.media is not media:
+                return
+            try:
+                _send_caption(tv, server, media, media["sub_path"])
+            except TVError:
+                return
 
 
 def play_media(tv, server, media, start_at=0, wait=20.0, subs_on=False):
@@ -926,11 +978,13 @@ def play_media(tv, server, media, start_at=0, wait=20.0, subs_on=False):
         pass  # nothing was playing
     tv.set_media(url, media["title"], media["mime"], media["size"], sub_url=sub)
     tv.play()
+    playing = False
     if (start_at and start_at > 1) or (sub and subs_on):
         deadline = time.time() + wait
         while time.time() < deadline:
             try:
                 if tv.state() == "PLAYING":
+                    playing = True
                     if start_at and start_at > 1:
                         tv.seek(start_at)
                     break
@@ -948,7 +1002,10 @@ def play_media(tv, server, media, start_at=0, wait=20.0, subs_on=False):
             except TVError:
                 break
             time.sleep(0.5)
-        return show_subtitle(tv, server, media, media["sub_path"])
+        result = show_subtitle(tv, server, media, media["sub_path"])
+        threading.Thread(target=_reshow_when_playing, daemon=True,
+                         args=(tv, server, media, media["caption_seq"], start_at, playing)).start()
+        return result
     return None
 
 

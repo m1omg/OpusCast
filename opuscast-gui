@@ -659,8 +659,9 @@ class OpusCastWindow(Gtk.ApplicationWindow):
 
     def _maybe_changed_on_tv(self, stamp):
         s = self.session
+        last_cmd = max(self.last_caption_cmd, s["media"]["caption_sent"]) if s else 0.0  # incl. the start-up resend
         if (s and s["kind"] == "movie" and s["seen_playing"] and self.last_caption_event < stamp - 0.5
-                and time.monotonic() - self.last_caption_cmd > 4):
+                and time.monotonic() - last_cmd > 4):
             s["sub_tv_changed"] = True
             self._update_sub_button()
         return False
