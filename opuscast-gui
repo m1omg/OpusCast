@@ -1,0 +1,1671 @@
+#!/usr/bin/env python3
+"""OpusCast - play videos from this PC on your smart TV (GTK 3 app)."""
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import opuscast_core as core  # noqa: E402
+import opuscast_intro as intro  # noqa: E402
+from opuscast_i18n import _  # noqa: E402
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+except (ImportError, ValueError):
+    sys.stderr.write(_("OpusCast needs PyGObject and GTK 3:") + f"\n  {core.install_hint(['gtk'])}\n")
+    sys.exit(1)
+
+try:
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+    Gst.init(None)
+except (ImportError, ValueError):
+    Gst = None
+
+fmt = core.fmt_time
+KEEP = object()
+INFO, WARNING, ERROR = Gtk.MessageType.INFO, Gtk.MessageType.WARNING, Gtk.MessageType.ERROR
+DEVICE_ICONS = {"tv": "video-display-symbolic", "speaker": "audio-speakers-symbolic",
+                "router": "network-wireless-symbolic", "pc": "computer-symbolic",
+                "upnp": "network-server-symbolic", "unknown": "dialog-question-symbolic"}
+CSS = b"""
+.dropzone { border: 2px dashed alpha(@theme_fg_color, 0.3); border-radius: 14px; padding: 26px; }
+.dropzone.hover { border-color: @theme_selected_bg_color; background-color: alpha(@theme_selected_bg_color, 0.12); }
+.big-title { font-size: 17pt; font-weight: bold; }
+.play-button { min-width: 64px; min-height: 64px; border-radius: 32px; padding: 0; }
+.video-area { background-color: #000000; }
+.badge-ok { color: #26a269; font-weight: bold; }
+.badge-audio { color: #c88800; font-weight: bold; }
+.badge-no { opacity: 0.6; }
+.section-title { font-weight: bold; opacity: 0.8; }
+"""
+
+
+def which(name):
+    return shutil.which(name) or shutil.which(name, path="/usr/sbin:/sbin:/usr/local/sbin")
+
+
+def icon_name(*names):
+    theme = Gtk.IconTheme.get_default()
+    return next((n for n in names if theme.has_icon(n)), names[-1])
+
+
+def shorten(text, n=60):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+# ---------------------------------------------------------------- background helpers
+
+class Worker:
+    """Runs TV commands one after another, off the GUI thread."""
+
+    def __init__(self, on_error):
+        self.q, self.on_error = queue.Queue(), on_error
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, fn, *args, done=None, **kwargs):
+        self.q.put((fn, args, kwargs, done))
+
+    def _run(self):
+        while True:
+            fn, args, kwargs, done = self.q.get()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - every failure is shown to the user
+                GLib.idle_add(self.on_error, e)
+                continue
+            if done:
+                GLib.idle_add(self._finish, done, result)
+
+    @staticmethod
+    def _finish(done, result):
+        done(result)
+        return False
+
+
+class Poller(threading.Thread):
+    """Asks the TV what it's doing: twice a second while playing, every 5 s otherwise."""
+
+    def __init__(self, callback):
+        super().__init__(daemon=True)
+        self.callback, self.tv, self.wake = callback, None, threading.Event()
+        self.active = False
+
+    def run(self):
+        last_volume = 0.0
+        while True:
+            tv = self.tv
+            if tv is None:
+                self.wake.wait(1)
+                self.wake.clear()
+                continue
+            result = {"tv": tv}
+            try:
+                result["state"] = tv.state()
+                result["pos"], result["dur"], result["uri"] = tv.position()
+                if time.monotonic() - last_volume > 4:
+                    last_volume = time.monotonic()
+                    try:
+                        result["volume"] = tv.get_volume()
+                    except core.TVError:
+                        pass
+            except core.TVError as e:
+                result["error"] = str(e)
+            GLib.idle_add(self.callback, result)
+            self.wake.wait(2.0 if "error" in result else 0.5 if self.active else 5.0)
+            self.wake.clear()
+
+
+class Preview:
+    """A muted copy of the video on this PC, kept in step with the TV."""
+
+    def __init__(self, on_error, on_widget):
+        self.on_error, self.on_widget = on_error, on_widget
+        self.ok, self.reason, self.widget, self.gl = False, "", None, False
+        self.path, self.playing, self.prerolled, self.pending = None, False, False, None
+        if Gst is None:
+            self.reason = _("GStreamer isn't installed")
+            return
+        self.pb = Gst.ElementFactory.make("playbin", "opuscast-preview")
+        if self.pb is None:
+            self.reason = _("the GStreamer base plugins aren't installed")
+            return
+        if not self._make_sink(prefer_gl=os.environ.get("OPUSCAST_PREVIEW_SINK") != "gtk"):
+            self.reason = _("the GStreamer GTK plugin isn't installed")
+            return
+        self.pb.set_property("flags", 0x1 | 0x200)  # video + deinterlace only: no audio, no subtitles
+        bus = self.pb.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_error)
+        bus.connect("message::async-done", self._on_async_done)
+        self.ok = True
+
+    def _make_sink(self, prefer_gl):
+        sink = widget = None
+        if prefer_gl:
+            gl, gl_bin = Gst.ElementFactory.make("gtkglsink", None), Gst.ElementFactory.make("glsinkbin", None)
+            if gl and gl_bin:
+                gl_bin.set_property("sink", gl)
+                sink, widget, self.gl = gl_bin, gl.props.widget, True
+        if sink is None:
+            plain = Gst.ElementFactory.make("gtksink", None)
+            if plain:
+                sink, widget, self.gl = plain, plain.props.widget, False
+        if sink is None:
+            return False
+        self.pb.set_property("video-sink", sink)
+        old, self.widget = self.widget, widget
+        if old is not None:
+            self.on_widget(old, widget)
+        return True
+
+    def _on_error(self, _bus, msg):
+        err, _debug = msg.parse_error()
+        path, pos = self.path, self.position() or 0.0
+        self.pb.set_state(Gst.State.NULL)
+        if self.gl and self._make_sink(prefer_gl=False):  # GL trouble: fall back to the plain sink once
+            if path:
+                self.load(path, pos)
+            return
+        self.unload()
+        self.on_error(err.message)
+
+    def load(self, path, pos=0.0):
+        self.pb.set_state(Gst.State.NULL)
+        self.pb.set_property("uri", Gst.filename_to_uri(path))
+        self.path, self.playing, self.prerolled, self.pending = path, False, False, pos
+        self.pb.set_state(Gst.State.PAUSED)
+
+    def unload(self):
+        if self.ok:
+            self.pb.set_state(Gst.State.NULL)
+        self.path, self.playing, self.prerolled, self.pending = None, False, False, None
+
+    def _on_async_done(self, *_args):
+        self.prerolled = True
+        if self.pending is not None:
+            pos, self.pending = self.pending, None
+            self._seek(pos, True)
+
+    def seek(self, pos, accurate=True):
+        if not self.path:
+            return
+        if not self.prerolled:
+            self.pending = pos
+            return
+        self._seek(pos, accurate)
+
+    def _seek(self, pos, accurate):
+        flags = Gst.SeekFlags.FLUSH | (Gst.SeekFlags.ACCURATE if accurate
+                                       else Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.SNAP_NEAREST)
+        self.pb.seek_simple(Gst.Format.TIME, flags, int(max(0.0, pos) * Gst.SECOND))
+
+    def set_playing(self, on):
+        if self.path and on != self.playing:
+            self.playing = on
+            self.pb.set_state(Gst.State.PLAYING if on else Gst.State.PAUSED)
+
+    def position(self):
+        if not (self.path and self.prerolled):
+            return None
+        ok, p = self.pb.query_position(Gst.Format.TIME)
+        return p / Gst.SECOND if ok and p >= 0 else None
+
+
+# ---------------------------------------------------------------- main window
+
+class OpusCastWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=core.APP_NAME)
+        self.set_default_size(780, 680)
+        self.set_icon_name(core.APP_ID)
+        self.cfg = core.load_config()
+        self.server = core.MediaServer()
+        self.server.httpd.on_event = self._on_event_thread
+        self.tv = None
+        self.session = None
+        self.gen = 0
+        self.tv_state, self.tv_pos, self.tv_pos_raw, self.pos_seen, self.tv_dur = "UNKNOWN", 0.0, None, 0.0, 0.0
+        self.hold = None  # (target, since, timeout) after a seek, until the TV catches up
+        self.dragging, self.drag_value, self.last_scrub, self.seek_timer = False, None, 0.0, None
+        self.vol_timer, self.vol_touched, self.setting_vol = None, 0.0, False
+        self.last_save, self.poll_errors, self.range_dur = 0.0, 0, None
+        self.devices, self.scanning, self.scanned_at = [], False, 0.0
+        self.pending_play = None
+        self.event_sids, self.last_caption_event, self.last_caption_cmd = {}, 0.0, 0.0
+        self.worker = Worker(self._on_worker_error)
+        self.preview = Preview(self._on_preview_error, self._swap_preview_widget)
+        self._build_ui()
+        self.poller = Poller(self._on_poll)
+        self.poller.start()
+        GLib.timeout_add(250, self._tick)
+        GLib.timeout_add_seconds(600, self._renew_events)
+        self.connect("delete-event", self._on_close)
+        self.connect("key-press-event", self._on_key)
+        self._find_tv()
+
+    # ------------------------------------------------------------ UI construction
+
+    def _build_ui(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # GNOME-style title bars only where they're native. Elsewhere (Cinnamon, KDE, Xfce, ...) the
+        # window manager's own title bar maximizes and resizes reliably. OPUSCAST_HEADERBAR=0/1 overrides.
+        desktops = set(os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":"))
+        choice = os.environ.get("OPUSCAST_HEADERBAR")
+        use_headerbar = choice == "1" if choice in ("0", "1") else bool(desktops & {"GNOME", "PANTHEON", "BUDGIE"})
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self.dev_button = Gtk.MenuButton(tooltip_text=_("Choose the TV - see which devices on your network can play video"))
+        box = Gtk.Box(spacing=6)
+        box.pack_start(Gtk.Image.new_from_icon_name("video-display-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        self.dev_label = Gtk.Label(label=_("TV"), ellipsize=Pango.EllipsizeMode.END, max_width_chars=18)
+        box.pack_start(self.dev_label, False, False, 0)
+        box.pack_start(Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        self.dev_button.add(box)
+        self.dev_button.set_popover(self._build_device_popover())
+
+        if use_headerbar:
+            self.header, self.subtitle_label = Gtk.HeaderBar(show_close_button=True, title=core.APP_NAME), None
+            self.set_titlebar(self.header)
+            self.header.pack_start(self.dev_button)
+            open_btn = Gtk.Button.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON)
+            self.header.pack_end(open_btn)
+        else:
+            self.header = None
+            toolbar = Gtk.Box(spacing=10, margin=8, margin_start=12, margin_end=12)
+            toolbar.pack_start(self.dev_button, False, False, 0)
+            self.subtitle_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            self.subtitle_label.get_style_context().add_class("dim-label")
+            toolbar.pack_start(self.subtitle_label, True, True, 0)
+            open_btn = Gtk.Button(label=_("Open video"), always_show_image=True,
+                                  image=Gtk.Image.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON))
+            toolbar.pack_end(open_btn, False, False, 0)
+            outer.pack_start(toolbar, False, False, 0)
+            outer.pack_start(Gtk.Separator(), False, False, 0)
+        open_btn.set_tooltip_text(_("Choose a video (Ctrl+O)"))
+        open_btn.connect("clicked", lambda *_a: self.choose_file())
+        self._set_subtitle(_("Looking for your TV…"))
+
+        self.info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.pack_start(self.info_box, False, False, 0)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self._build_pick_page(), "pick")
+        self.stack.add_named(self._build_player_page(), "player")
+        outer.pack_start(self.stack, True, True, 0)
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+        outer.pack_start(self._build_options_bar(), False, False, 0)
+        self.add(outer)
+
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)], Gdk.DragAction.COPY)
+        self.connect("drag-data-received", self._on_drop)
+        self.connect("drag-motion", lambda *_a: self.dropzone.get_style_context().add_class("hover"))
+        self.connect("drag-leave", lambda *_a: self.dropzone.get_style_context().remove_class("hover"))
+        self.show_all()
+
+    def _build_pick_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=18)
+        self.dropzone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.dropzone.get_style_context().add_class("dropzone")
+        icon = Gtk.Image.new_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
+        icon.set_pixel_size(72)
+        title = Gtk.Label(label=_("Drop a video here"))
+        title.get_style_context().add_class("big-title")
+        sub = Gtk.Label(label=_("It plays on your TV - control it with the TV remote or the buttons here."),
+                        wrap=True, justify=Gtk.Justification.CENTER)
+        sub.get_style_context().add_class("dim-label")
+        btn = Gtk.Button(label=_("Choose Video…"), halign=Gtk.Align.CENTER)
+        btn.get_style_context().add_class("suggested-action")
+        btn.set_size_request(220, 46)
+        btn.connect("clicked", lambda *_a: self.choose_file())
+        for w in (icon, title, sub, btn):
+            self.dropzone.pack_start(w, False, False, 0)
+        page.pack_start(self.dropzone, False, False, 0)
+
+        hdr = Gtk.Label(label=_("Recent"), xalign=0)
+        hdr.get_style_context().add_class("section-title")
+        page.pack_start(hdr, False, False, 0)
+        self.recent_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.recent_list.connect("row-activated", lambda _l, row: self.play_file(row.path))
+        empty = Gtk.Label(label=_("Videos you play will show up here, so you can carry on where you left off."),
+                          wrap=True, margin=18)
+        empty.get_style_context().add_class("dim-label")
+        empty.show()
+        self.recent_list.set_placeholder(empty)
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, shadow_type=Gtk.ShadowType.IN)
+        sw.add(self.recent_list)
+        page.pack_start(sw, True, True, 0)
+        self._refresh_recent()
+        return page
+
+    def _build_player_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=18)
+        self.video_box = Gtk.EventBox(vexpand=True)
+        self.video_box.get_style_context().add_class("video-area")
+        self.video_box.set_size_request(480, 270)
+        self.video_box.set_no_show_all(True)
+        if self.preview.ok:
+            self.video_box.add(self.preview.widget)
+        page.pack_start(self.video_box, True, True, 0)
+
+        self.placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER,
+                                   vexpand=True)
+        img = Gtk.Image.new_from_icon_name("video-display-symbolic", Gtk.IconSize.DIALOG)
+        img.set_pixel_size(96)
+        img.get_style_context().add_class("dim-label")
+        self.placeholder_label = Gtk.Label()
+        self.placeholder_label.get_style_context().add_class("dim-label")
+        self.placeholder.pack_start(img, False, False, 0)
+        self.placeholder.pack_start(self.placeholder_label, False, False, 0)
+        page.pack_start(self.placeholder, True, True, 0)
+
+        self.title_label = Gtk.Label(ellipsize=Pango.EllipsizeMode.END)
+        self.title_label.get_style_context().add_class("big-title")
+        self.status_label = Gtk.Label()
+        self.status_label.get_style_context().add_class("dim-label")
+        page.pack_start(self.title_label, False, False, 0)
+        page.pack_start(self.status_label, False, False, 0)
+
+        row = Gtk.Box(spacing=10)
+        self.elapsed = Gtk.Label(label="0:00:00", width_chars=8)
+        self.total = Gtk.Label(label="--:--", width_chars=8)
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
+        self.scale.set_draw_value(False)
+        self.scale.set_tooltip_text(_("Drag to jump (with “Show on PC” on you see where you're going)"))
+        self.scale.connect("change-value", self._on_scale_change)
+        self.scale.connect("button-press-event", self._on_scale_press)
+        self.scale.connect("button-release-event", self._on_scale_release)
+        row.pack_start(self.elapsed, False, False, 0)
+        row.pack_start(self.scale, True, True, 0)
+        row.pack_start(self.total, False, False, 0)
+        page.pack_start(row, False, False, 0)
+
+        def button(icon, label, tip, callback, icon_right=False):
+            b = Gtk.Button(label=label, tooltip_text=tip, always_show_image=True)
+            b.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+            if icon_right:
+                b.set_image_position(Gtk.PositionType.RIGHT)
+            b.set_size_request(-1, 44)
+            b.set_valign(Gtk.Align.CENTER)
+            b.connect("clicked", lambda *_a: callback())
+            return b
+
+        controls = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        controls.pack_start(button("media-seek-backward-symbolic", _("30s"), _("Back 30 seconds (Shift+←)"),
+                                   lambda: self.skip(-30)), False, False, 0)
+        controls.pack_start(button("media-seek-backward-symbolic", _("10s"), _("Back 10 seconds (←)"),
+                                   lambda: self.skip(-10)), False, False, 0)
+        self.play_btn = Gtk.Button(tooltip_text=_("Play / pause (Space)"), valign=Gtk.Align.CENTER)
+        self.play_btn.get_style_context().add_class("play-button")
+        self.play_btn.get_style_context().add_class("suggested-action")
+        self.play_icon = "media-playback-start-symbolic"
+        self.play_img = Gtk.Image.new_from_icon_name(self.play_icon, Gtk.IconSize.DND)
+        self.play_btn.add(self.play_img)
+        self.play_btn.connect("clicked", lambda *_a: self.toggle_play())
+        controls.pack_start(self.play_btn, False, False, 6)
+        controls.pack_start(button("media-seek-forward-symbolic", _("10s"), _("Forward 10 seconds (→)"),
+                                   lambda: self.skip(10), True), False, False, 0)
+        controls.pack_start(button("media-seek-forward-symbolic", _("30s"), _("Forward 30 seconds (Shift+→)"),
+                                   lambda: self.skip(30), True), False, False, 0)
+        page.pack_start(controls, False, False, 0)
+
+        controls2 = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        controls2.pack_start(button("media-playback-stop-symbolic", _("Stop"), _("Stop playback"), self.stop),
+                             False, False, 0)
+        self.sub_button = Gtk.MenuButton(tooltip_text=_("Subtitles (S)"), valign=Gtk.Align.CENTER)
+        self.sub_button.set_size_request(-1, 44)
+        sub_box = Gtk.Box(spacing=6)
+        sub_box.pack_start(Gtk.Image.new_from_icon_name(
+            icon_name("media-view-subtitles-symbolic", "format-justify-center-symbolic"), Gtk.IconSize.BUTTON),
+            False, False, 0)
+        self.sub_label = Gtk.Label(label=_("Subtitles"), ellipsize=Pango.EllipsizeMode.END, max_width_chars=28)
+        sub_box.pack_start(self.sub_label, False, False, 0)
+        sub_box.pack_start(Gtk.Image.new_from_icon_name("pan-up-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        self.sub_button.add(sub_box)
+        self.sub_popover = Gtk.Popover()
+        self.sub_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=10)
+        self.sub_popover.add(self.sub_menu)
+        self.sub_popover.connect("show", lambda *_a: self._fill_sub_menu())
+        self.sub_button.set_popover(self.sub_popover)
+        self.sub_button.show_all()
+        self.sub_button.set_no_show_all(True)
+        self.sub_button.hide()
+        controls2.pack_start(self.sub_button, False, False, 0)
+        self.skip_intro_btn = button("go-next-symbolic", _("Skip intro"), _("Start the video now"), self.skip_intro, True)
+        self.skip_intro_btn.show_all()
+        self.skip_intro_btn.set_no_show_all(True)
+        self.skip_intro_btn.hide()
+        controls2.pack_start(self.skip_intro_btn, False, False, 0)
+        self.volume = Gtk.VolumeButton(valign=Gtk.Align.CENTER)
+        self.volume.connect("value-changed", self._on_volume)
+        controls2.pack_start(self.volume, False, False, 0)
+        page.pack_start(controls2, False, False, 0)
+        return page
+
+    def _build_options_bar(self):
+        bar = Gtk.Box(spacing=22, margin=10, margin_start=18, margin_end=18)
+
+        def toggle(text, tip, active, callback):
+            b = Gtk.Box(spacing=8, tooltip_text=tip)
+            sw = Gtk.Switch(active=bool(active), valign=Gtk.Align.CENTER)
+            sw.connect("notify::active", callback)
+            b.pack_start(sw, False, False, 0)
+            b.pack_start(Gtk.Label(label=text), False, False, 0)
+            bar.pack_start(b, False, False, 0)
+            return sw
+
+        self.preview_switch = toggle(_("Show on PC"), _("Show a muted copy of the video here, in step with the TV (P)"),
+                                     self.cfg.get("preview") and self.preview.ok, self._on_preview_toggled)
+        self.intro_switch = toggle(_("Skynet intro"), _("Play the Skynet boot animation before each video"),
+                                   self.cfg.get("intro") and intro.available()[0], self._on_intro_toggled)
+        hint = Gtk.Label(label=_("Keep OpusCast open while you watch"), xalign=1, ellipsize=Pango.EllipsizeMode.END)
+        hint.get_style_context().add_class("dim-label")
+        bar.pack_end(hint, True, True, 0)
+        return bar
+
+    def _build_device_popover(self):
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        box.set_size_request(460, -1)
+        top = Gtk.Box(spacing=8)
+        title = Gtk.Label(xalign=0)
+        title.set_markup(f"<b>{GLib.markup_escape_text(_('Devices on your network'))}</b>")
+        self.scan_spinner = Gtk.Spinner()
+        rescan = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        rescan.set_tooltip_text(_("Scan again"))
+        rescan.connect("clicked", lambda *_a: self._scan(force=True))
+        top.pack_start(title, True, True, 0)
+        top.pack_start(self.scan_spinner, False, False, 0)
+        top.pack_start(rescan, False, False, 0)
+        box.pack_start(top, False, False, 0)
+        self.dev_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.dev_list.connect("row-activated", self._on_device_row)
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, shadow_type=Gtk.ShadowType.IN)
+        sw.set_propagate_natural_height(True)
+        sw.set_max_content_height(430)
+        sw.add(self.dev_list)
+        box.pack_start(sw, True, True, 0)
+        hint = Gtk.Label(label=_("Pick a device marked “Can play video”. Routers, phones and speakers can't show videos."),
+                         wrap=True, xalign=0, max_width_chars=50)
+        hint.get_style_context().add_class("dim-label")
+        box.pack_start(hint, False, False, 0)
+        box.show_all()
+        pop.add(box)
+        pop.connect("show", lambda *_a: self._scan())
+        self._refresh_device_rows()
+        return pop
+
+    # ------------------------------------------------------------ messages
+
+    def _set_subtitle(self, text):
+        if self.header:
+            self.header.set_subtitle(text)
+        else:
+            self._set_text(self.subtitle_label, text)
+
+    @staticmethod
+    def _set_text(label, text):
+        if label.get_text() != text:  # every set_text re-lays out the whole window
+            label.set_text(text)
+
+    def show_info(self, text, kind=INFO, actions=(), selectable=None):
+        self.clear_info()
+        bar = Gtk.InfoBar(message_type=kind, show_close_button=True)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        content.pack_start(Gtk.Label(label=text, xalign=0, wrap=True), False, False, 0)
+        if selectable:
+            cmd = Gtk.Label(xalign=0, wrap=True, selectable=True)
+            cmd.set_markup(f"<tt>{GLib.markup_escape_text(selectable)}</tt>")
+            content.pack_start(cmd, False, False, 0)
+        bar.get_content_area().pack_start(content, True, True, 0)
+        for i, (label, _cb) in enumerate(actions):
+            bar.add_button(label, i + 1)
+
+        def respond(b, response):
+            b.destroy()
+            if response > 0:
+                actions[response - 1][1]()
+        bar.connect("response", respond)
+        self.info_box.pack_start(bar, False, False, 0)
+        bar.show_all()
+
+    def clear_info(self):
+        for child in self.info_box.get_children():
+            child.destroy()
+
+    # ------------------------------------------------------------ TV selection & events
+
+    def _find_tv(self):
+        self._set_subtitle(_("Looking for your TV…"))
+        location = (self.cfg.get("tv") or {}).get("location")
+
+        def work():
+            try:
+                tv = core.find_tv(location=location)
+            except Exception:  # noqa: BLE001
+                tv = None
+            GLib.idle_add(self._found_tv, tv)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _found_tv(self, tv):
+        if tv:
+            self.select_tv(tv)
+        elif not self.tv:
+            self._set_subtitle(_("No TV found"))
+            self.dev_label.set_text(_("No TV"))
+            self.show_info(_("Couldn't find a TV. Make sure it's switched on and on the same network as this PC."),
+                           WARNING, [(_("Search again"), self._find_tv),
+                                     (_("Show devices"), lambda: self.dev_button.set_active(True))])
+        return False
+
+    def select_tv(self, tv):
+        if self.tv and tv.location != self.tv.location and self.session:
+            self.stop()
+        old, self.tv = self.tv, tv
+        if old is not None and old.location != tv.location:
+            self._unsubscribe_events(old)
+        self.poller.tv = tv
+        self.poller.wake.set()
+        self.poll_errors = 0
+        self.dev_label.set_text(tv.name)
+        self._set_subtitle(_("Connected to {tv}").format(tv=tv.name))
+        self.cfg["tv"] = {"location": tv.location, "name": tv.name}
+        self._save()
+        self.clear_info()
+        self._refresh_device_rows()
+        self._subscribe_events(tv)
+        if self.pending_play:
+            args, self.pending_play = self.pending_play, None
+            self.play_file(*args)
+
+    def _subscribe_events(self, tv):
+        def work():
+            sids = {}
+            for service in ("AVTransport", "RenderingControl"):
+                try:
+                    sids[service] = tv.subscribe(service, self.server.event_url(tv.host, service))[0]
+                except core.TVError:
+                    pass
+            return sids
+        self.worker.submit(work, done=lambda sids: self._events_ready(tv, sids))
+
+    def _events_ready(self, tv, sids):
+        if tv is self.tv:
+            self.event_sids = sids
+        else:
+            self.worker.submit(lambda: [tv.unsubscribe(s, sid) for s, sid in sids.items()])
+
+    def _unsubscribe_events(self, tv):
+        sids, self.event_sids = self.event_sids, {}
+        self.worker.submit(lambda: [tv.unsubscribe(s, sid) for s, sid in sids.items()])
+
+    def _renew_events(self):
+        tv, sids = self.tv, dict(self.event_sids)
+        if tv and sids:
+            def work():
+                for service, sid in sids.items():
+                    try:
+                        tv.renew(service, sid)
+                    except core.TVError:
+                        return False
+                return True
+            self.worker.submit(work, done=lambda ok: ok or self._subscribe_events(tv))
+        return True
+
+    def _on_event_thread(self, service, sid, body):  # called from the server thread
+        GLib.idle_add(self._on_event, service, sid, body)
+
+    def _on_event(self, service, sid, body):
+        if sid not in self.event_sids.values():
+            return False  # left over from an earlier run
+        if service == "AVTransport":
+            self.poller.wake.set()  # react to the TV remote right away
+            return False
+        changes = core.parse_last_change(body)
+        if changes is None:
+            return False
+        now = time.monotonic()
+        if "Volume" in changes and changes["Volume"].isdigit() and now - self.vol_touched > 3:
+            self.setting_vol = True
+            self.volume.set_value(int(changes["Volume"]) / 100)
+            self.setting_vol = False
+        s = self.session
+        if "X_EnabledCaptions" in changes:
+            self.last_caption_event = now
+            if s and s["kind"] == "movie":
+                media = s["media"]
+                shown = {urllib.parse.urlsplit(u).path for u in core.caption_uris(changes["X_EnabledCaptions"])}
+                s["sub_on"] = bool(shown & (set(media["subs"]) - {media["blank_path"]}))
+                by_path = {p: i for i, p in s["paths"].items()}
+                shown_id = next((by_path[p] for p in shown if p in by_path), None)
+                if shown_id and s["subs"]:
+                    s["sub_entry"] = next((e for e in s["subs"] if e["id"] == shown_id), s["sub_entry"])
+                s["sub_tv_changed"], s["caption_api"] = False, True
+                self._update_sub_button()
+        elif not changes:
+            # the TV says "something changed" but not what: that's what its own subtitle menu sends
+            GLib.timeout_add(1500, self._maybe_changed_on_tv, now)
+        return False
+
+    def _maybe_changed_on_tv(self, stamp):
+        s = self.session
+        if (s and s["kind"] == "movie" and s["seen_playing"] and self.last_caption_event < stamp - 0.5
+                and time.monotonic() - self.last_caption_cmd > 4):
+            s["sub_tv_changed"] = True
+            self._update_sub_button()
+        return False
+
+    def _scan(self, force=False):
+        if self.scanning or (not force and self.devices and time.monotonic() - self.scanned_at < 60):
+            return
+        self.scanning = True
+        self.scan_spinner.start()
+        self._refresh_device_rows()
+
+        def work():
+            try:
+                devices = core.scan_network()
+            except Exception:  # noqa: BLE001
+                devices = []
+            GLib.idle_add(self._scan_done, devices)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _scan_done(self, devices):
+        self.scanning = False
+        self.scan_spinner.stop()
+        self.devices, self.scanned_at = devices, time.monotonic()
+        self._refresh_device_rows()
+        return False
+
+    def _refresh_device_rows(self):
+        for child in self.dev_list.get_children():
+            child.destroy()
+        if not self.devices:
+            msg = _("Scanning your network…") if self.scanning else _("Open this list to scan your network.")
+            lbl = Gtk.Label(label=msg, margin=14)
+            lbl.get_style_context().add_class("dim-label")
+            self.dev_list.add(lbl)
+        for d in self.devices:
+            row = Gtk.ListBoxRow(activatable=d["can_play"])
+            row.device = d
+            hb = Gtk.Box(spacing=10, margin=8)
+            img = Gtk.Image.new_from_icon_name(DEVICE_ICONS[d["kind"]], Gtk.IconSize.DND)
+            if not d["can_play"]:
+                img.get_style_context().add_class("dim-label")
+            hb.pack_start(img, False, False, 0)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            name.set_markup(f"<b>{GLib.markup_escape_text(d['name'])}</b>")
+            vb.pack_start(name, False, False, 0)
+            sub = Gtk.Label(label=" · ".join(x for x in (d["ip"], d["detail"]) if x), xalign=0,
+                            ellipsize=Pango.EllipsizeMode.END)
+            sub.get_style_context().add_class("dim-label")
+            vb.pack_start(sub, False, False, 0)
+            if d["kind"] == "tv":
+                note, cls = "✓ " + _("Can play video"), "badge-ok"
+            elif d["kind"] == "speaker":
+                note, cls = "♪ " + d["note"], "badge-audio"
+            elif d["kind"] == "pc":
+                note, cls = d["note"], "badge-no"
+            else:
+                note, cls = "✗ " + d["note"], "badge-no"
+            badge = Gtk.Label(label=note, xalign=0, wrap=True, max_width_chars=46)
+            badge.get_style_context().add_class(cls)
+            vb.pack_start(badge, False, False, 0)
+            hb.pack_start(vb, True, True, 0)
+            if self.tv and d["tv"] and d["ip"] == self.tv.host:
+                using = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+                using.pack_start(Gtk.Image.new_from_icon_name("object-select-symbolic", Gtk.IconSize.BUTTON),
+                                 False, False, 0)
+                using.pack_start(Gtk.Label(label=_("In use")), False, False, 0)
+                hb.pack_end(using, False, False, 0)
+            elif d["can_play"]:
+                use = Gtk.Button(label=_("Use this TV"), valign=Gtk.Align.CENTER)
+                use.connect("clicked", lambda _b, dev=d: self._use_device(dev))
+                hb.pack_end(use, False, False, 0)
+            row.add(hb)
+            self.dev_list.add(row)
+        self.dev_list.show_all()
+
+    def _on_device_row(self, _list, row):
+        device = getattr(row, "device", None)
+        if device and device["can_play"]:
+            self._use_device(device)
+
+    def _use_device(self, device):
+        self.dev_button.set_active(False)
+        self.select_tv(device["tv"])
+
+    # ------------------------------------------------------------ recent list
+
+    def _recent_item(self, path):
+        return next((r for r in self.cfg["recent"] if r.get("path") == path), None)
+
+    def _remember(self, path, pos=None, dur=None, watched=None, sub=KEEP):
+        old = self._recent_item(path) or {}
+        item = {"path": path, "pos": old.get("pos", 0), "dur": old.get("dur", 0),
+                "watched": old.get("watched", False), "sub": old.get("sub")}
+        if pos is not None:
+            item["pos"] = round(pos, 1)
+            if pos > 5:
+                item["watched"] = False
+        if dur:
+            item["dur"] = dur
+        if watched is not None:
+            item["watched"] = watched
+        if sub is not KEEP:
+            item["sub"] = sub
+        self.cfg["recent"] = [item] + [r for r in self.cfg["recent"] if r.get("path") != path][:19]
+        self._save()
+
+    def _forget(self, path):
+        self.cfg["recent"] = [r for r in self.cfg["recent"] if r.get("path") != path]
+        self._save()
+        self._refresh_recent()
+
+    def _refresh_recent(self):
+        for child in self.recent_list.get_children():
+            child.destroy()
+        home = os.path.expanduser("~")
+        for item in self.cfg["recent"]:
+            path = item.get("path", "")
+            if not os.path.isfile(path):
+                continue
+            pos, dur, watched = item.get("pos", 0), item.get("dur", 0), item.get("watched")
+            row = Gtk.ListBoxRow()
+            row.path = path
+            hb = Gtk.Box(spacing=12, margin=8)
+            hb.pack_start(Gtk.Image.new_from_icon_name("video-x-generic", Gtk.IconSize.DND), False, False, 0)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, valign=Gtk.Align.CENTER)
+            title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            title.set_markup(f"<b>{GLib.markup_escape_text(os.path.splitext(os.path.basename(path))[0])}</b>")
+            vb.pack_start(title, False, False, 0)
+            if watched:
+                status = _("Watched")
+            elif pos > 5 and dur:
+                status = _("Resume at {pos} of {dur}").format(pos=fmt(pos), dur=fmt(dur))
+            elif pos > 5:
+                status = _("Resume at {pos}").format(pos=fmt(pos))
+            else:
+                status = _("Not started")
+            folder = os.path.dirname(path)
+            if folder.startswith(home):
+                folder = "~" + folder[len(home):]
+            sub = Gtk.Label(label=f"{status}  ·  {folder}", xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            sub.get_style_context().add_class("dim-label")
+            vb.pack_start(sub, False, False, 0)
+            if pos > 5 and dur and not watched:
+                vb.pack_start(Gtk.ProgressBar(fraction=min(1.0, pos / dur)), False, False, 2)
+            hb.pack_start(vb, True, True, 0)
+            if pos > 5 and not watched:
+                again = Gtk.Button.new_from_icon_name("media-skip-backward-symbolic", Gtk.IconSize.BUTTON)
+                again.set_tooltip_text(_("Play from the beginning"))
+                again.set_relief(Gtk.ReliefStyle.NONE)
+                again.set_valign(Gtk.Align.CENTER)
+                again.connect("clicked", lambda _b, p=path: self.play_file(p, start_at=0))
+                hb.pack_start(again, False, False, 0)
+            remove = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON)
+            remove.set_tooltip_text(_("Remove from this list"))
+            remove.set_relief(Gtk.ReliefStyle.NONE)
+            remove.set_valign(Gtk.Align.CENTER)
+            remove.connect("clicked", lambda _b, p=path: self._forget(p))
+            hb.pack_start(remove, False, False, 0)
+            row.add(hb)
+            self.recent_list.add(row)
+        self.recent_list.show_all()
+
+    # ------------------------------------------------------------ playback
+
+    def choose_file(self):
+        dlg = Gtk.FileChooserNative.new(_("Choose a video to play on the TV"), self, Gtk.FileChooserAction.OPEN,
+                                        _("_Play"), _("_Cancel"))
+        videos = Gtk.FileFilter()
+        videos.set_name(_("Videos"))
+        videos.add_mime_type("video/*")
+        for ext in core.VIDEO_EXTS:
+            videos.add_pattern("*" + ext)
+            videos.add_pattern("*" + ext.upper())
+        everything = Gtk.FileFilter()
+        everything.set_name(_("All files"))
+        everything.add_pattern("*")
+        dlg.add_filter(videos)
+        dlg.add_filter(everything)
+        start = self.cfg.get("last_dir") or GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS)
+        if start and os.path.isdir(start):
+            dlg.set_current_folder(start)
+        response = dlg.run()
+        path = dlg.get_filename()
+        dlg.destroy()
+        if response == Gtk.ResponseType.ACCEPT and path:
+            self.play_file(path)
+
+    def _on_drop(self, _w, _ctx, _x, _y, data, _info, _time):
+        self.dropzone.get_style_context().remove_class("hover")
+        paths = []
+        for uri in data.get_uris() or []:
+            try:
+                paths.append(GLib.filename_from_uri(uri)[0])
+            except GLib.Error:
+                continue
+        subs = [p for p in paths if p.lower().endswith(core.SUB_EXTS)]
+        if subs and self.session and self.session["kind"] == "movie" and len(subs) == len(paths):
+            self._use_sub_file(subs[0])  # a subtitle file dropped while a video plays
+            return
+        for path in paths:
+            if os.path.isfile(path) and not path.lower().endswith(core.SUB_EXTS):
+                self.play_file(path)
+                return
+        self.show_info(_("That doesn't look like a video file on this PC."), WARNING)
+
+    def play_file(self, path, start_at=None):
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            self.show_info(_("File not found: {path}").format(path=path), WARNING)
+            return
+        if not self.tv:
+            self.pending_play = (path, start_at)
+            self.show_info(_("Waiting for the TV - the video starts as soon as it's found."))
+            return
+        self.cfg["last_dir"] = os.path.dirname(path)
+        item = self._recent_item(path)
+        if start_at is None:
+            start_at = item["pos"] if item and not item.get("watched") and item.get("pos", 0) > 5 else 0
+        sub_id = item.get("sub") if item else None
+        if self.session:
+            self._end_session(stop_tv=False)
+        self.clear_info()
+        self._remember(path, pos=start_at)
+        self.gen += 1
+        gen = self.gen
+        if not sub_id:
+            self._begin(gen, path, start_at, None, None)
+            return
+        self._show_player(os.path.splitext(os.path.basename(path))[0], _("Preparing subtitles…"))
+
+        def work():  # the subtitle used last time, so it's on from the start
+            entries = core.list_subtitles(path)
+            entry = next((e for e in entries if e["id"] == sub_id and e["ok"]), None)
+            if entry is None and sub_id.startswith("file:") and os.path.isfile(sub_id[5:]):
+                entry = core.subtitle_file_entry(sub_id[5:])
+                entries.append(entry)
+            data = None
+            if entry:
+                try:
+                    data = core.prepare_subtitle(entry, path)
+                except core.TVError:
+                    entry = None
+            GLib.idle_add(self._begin, gen, path, start_at, (entry, data) if entry else None, entries)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _begin(self, gen, path, start_at, subtitle, subs):
+        if gen != self.gen:
+            return False
+        if self.intro_switch.get_active():
+            ok, reason = intro.available()
+            if ok:
+                self._start_intro(path, start_at, subtitle, subs)
+                return False
+            self.show_info(_("Skipping the Skynet intro: it {reason}.").format(reason=reason), WARNING)
+        self._start_session("movie", path, start_at, subtitle=subtitle, subs_on=bool(subtitle), subs=subs)
+        return False
+
+    def _start_intro(self, path, start_at, subtitle, subs):
+        self.gen += 1
+        gen = self.gen
+        self._show_player(_("Skynet is booting…"), _("Preparing the intro…"))
+
+        def work():
+            try:
+                clip = intro.ensure_intro()
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._intro_failed, gen, path, start_at, subtitle, subs, str(e))
+                return
+            GLib.idle_add(self._intro_ready, gen, clip, (path, start_at, subtitle, subs))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _intro_ready(self, gen, clip, next_up):
+        if gen == self.gen:
+            self._start_session("intro", clip, 0, next_up=next_up)
+        return False
+
+    def _intro_failed(self, gen, path, start_at, subtitle, subs, message):
+        if gen == self.gen:
+            self.show_info(_("The Skynet intro failed ({error}) - playing the video straight away.").format(
+                error=message), WARNING)
+            self._start_session("movie", path, start_at, subtitle=subtitle, subs_on=bool(subtitle), subs=subs)
+        return False
+
+    def _start_session(self, kind, path, start_at, next_up=None, subtitle=None, subs_on=False, subs=None):
+        self.gen += 1
+        entry, data = subtitle if subtitle else (None, None)
+        try:
+            media = self.server.publish(path, data)
+        except OSError as e:
+            self.show_info(_("Can't read that file: {error}").format(error=e), ERROR)
+            self.stack.set_visible_child_name("pick")
+            return
+        now = time.monotonic()
+        self.session = {"kind": kind, "path": path, "media": media, "next": next_up, "seen_playing": False,
+                        "started": now, "gen": self.gen, "subs": subs, "sub_entry": entry, "sub_on": False,
+                        "sub_tv_changed": False, "caption_api": None, "sub_loading": bool(entry and subs_on),
+                        "paths": {entry["id"]: media["sub_path"]} if entry else {}}
+        self.poller.active = True
+        self.tv_state, self.tv_pos, self.tv_pos_raw, self.pos_seen, self.tv_dur = "TRANSITIONING", float(start_at), None, now, 0.0
+        self.hold = (float(start_at), now, 30.0) if start_at else None
+        self.range_dur = None
+        self._show_player(_("Skynet is booting…") if kind == "intro" else media["title"], _("Starting on the TV…"))
+        self.skip_intro_btn.set_visible(kind == "intro")
+        self.sub_button.set_visible(kind == "movie")
+        if self.preview_switch.get_active():
+            self._preview_load()
+        gen = self.gen
+        if subs_on:
+            self.last_caption_cmd = now
+        self.worker.submit(core.play_media, self.tv, self.server, media, start_at, subs_on=subs_on,
+                           done=lambda result: self._play_started(gen, result))
+        GLib.timeout_add_seconds(15, self._check_fetched, gen)
+        if kind == "movie" and subs is None:
+            def find():
+                found = core.list_subtitles(path)
+                GLib.idle_add(self._subs_found, gen, found)
+            threading.Thread(target=find, daemon=True).start()
+        self._update_sub_button()
+        if kind == "movie" and start_at > 5:
+            self.show_info(_("Carrying on from {pos}.").format(pos=fmt(start_at)), INFO,
+                           [(_("Start from the beginning"), lambda: self.seek_to(0))])
+
+    def _play_started(self, gen, captions):
+        self.poller.wake.set()
+        s = self.session
+        if not (s and s["gen"] == gen and s["sub_entry"]):
+            return
+        s["sub_loading"] = False
+        self.last_caption_cmd = time.monotonic()
+        if captions == "ok":
+            s["sub_on"], s["caption_api"] = True, True
+        elif captions == "unsupported":
+            s["sub_on"], s["caption_api"] = True, False  # sent with the video; the TV decides
+        self._update_sub_button()
+
+    def _subs_found(self, gen, found):
+        s = self.session
+        if s and s["gen"] == gen and s["subs"] is None:
+            s["subs"] = found
+            self._update_sub_button()
+            if self.sub_popover.get_visible():
+                self._fill_sub_menu()
+        return False
+
+    def _show_player(self, title, status):
+        self.title_label.set_text(title)
+        self.status_label.set_text(status)
+        self.placeholder_label.set_text(_("Playing on {tv}").format(tv=self.tv.name) if self.tv else "")
+        self.elapsed.set_text("0:00:00")
+        self.total.set_text("--:--")
+        self.stack.set_visible_child_name("player")
+        self._update_video_area()
+
+    def _check_fetched(self, gen):
+        s = self.session
+        if s and s["gen"] == gen and not s["media"]["requested"].is_set():
+            self._firewall_help()
+        return False
+
+    def _firewall_help(self):
+        host, port = self.tv.host, self.server.port
+        rule = f"rule family=ipv4 source address={host} port port={port} protocol=tcp accept"
+        commands, fixes = [], []
+        if which("ufw"):
+            commands.append(f"sudo ufw allow from {host} to any port {port} proto tcp")
+            fixes.append([which("ufw"), "allow", "from", host, "to", "any", "port", str(port), "proto", "tcp"])
+        if which("firewall-cmd"):
+            commands.append(f"sudo firewall-cmd --permanent --add-rich-rule='{rule}' && sudo firewall-cmd --reload")
+            fwc = which("firewall-cmd")
+            fixes.append(["sh", "-c", f"'{fwc}' --permanent --add-rich-rule='{rule}' && '{fwc}' --reload"])
+        if not commands:
+            commands = [f"sudo ufw allow from {host} to any port {port} proto tcp"]
+        actions = [(_("Allow it (asks for your password)"), lambda: self._run_root(fixes[0]))] \
+            if fixes and which("pkexec") else []
+        self.show_info(_("The TV hasn't started loading the video. A firewall on this PC may be blocking it. "
+                         "This lets the TV in:"), WARNING, actions, selectable="\n".join(commands))
+
+    def _run_root(self, cmd):
+        def work():
+            try:
+                ok = subprocess.run([which("pkexec"), *cmd], capture_output=True, timeout=120).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                ok = False
+            GLib.idle_add(self._root_done, ok)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _root_done(self, ok):
+        s = self.session
+        if ok and s:
+            self.show_info(_("Firewall updated - starting the video again."))
+            self.play_file(s["path"], self.est_pos() if s["kind"] == "movie" else None)
+        elif ok:
+            self.show_info(_("Firewall updated."))
+        else:
+            self.show_info(_("The firewall wasn't changed."), WARNING)
+        return False
+
+    def est_pos(self):
+        if self.hold:
+            return self.hold[0]
+        p = self.tv_pos
+        if self.tv_state == "PLAYING":
+            p += min(time.monotonic() - self.pos_seen, 1.0)
+        return min(p, self.tv_dur) if self.tv_dur else p
+
+    def _on_poll(self, r):
+        if r["tv"] is not self.tv:
+            return False
+        if "error" in r:
+            self.poll_errors += 1
+            if self.poll_errors >= 3:
+                self._set_subtitle(_("Can't reach {tv} - is it on?").format(tv=self.tv.name))
+            return False
+        if self.poll_errors >= 3:
+            self._set_subtitle(_("Connected to {tv}").format(tv=self.tv.name))
+        self.poll_errors = 0
+        if r.get("volume") is not None and time.monotonic() - self.vol_touched > 3:
+            self.setting_vol = True
+            self.volume.set_value(r["volume"] / 100)
+            self.setting_vol = False
+        s = self.session
+        if not s:
+            return False
+        state, pos, dur, uri = r["state"], r["pos"], r["dur"], r["uri"]
+        ours = not uri or s["media"]["url_path"] in uri
+        now = time.monotonic()
+        if ours:
+            if state == "PLAYING":
+                s["seen_playing"] = True
+            if s["seen_playing"] and state in ("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"):
+                if pos is not None:
+                    if pos != self.tv_pos_raw:
+                        self.tv_pos_raw, self.pos_seen = pos, now
+                    self.tv_pos = float(pos)
+                if dur:
+                    self.tv_dur = float(dur)
+                self.tv_state = state
+        if self.hold:
+            target, since, limit = self.hold
+            arrived = ours and pos is not None and s["seen_playing"] and target - 2 <= pos <= target + 8
+            if arrived or now - since > limit:
+                self.hold = None
+        if s["seen_playing"] and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
+            self._session_finished()
+            return False
+        if not s["seen_playing"] and now - s["started"] > 40 and state in ("STOPPED", "NO_MEDIA_PRESENT"):
+            self._end_session(stop_tv=False)
+            self.show_info(_("The TV didn't start the video. It may not support this file's format "
+                             "(Dolby Vision files often don't work on Samsung TVs)."), ERROR)
+            return False
+        self._update_status()
+        self._sync_preview()
+        return False
+
+    def _update_status(self):
+        s = self.session
+        if not s:
+            return
+        st = self.tv_state if s["seen_playing"] else "STARTING"
+        text = {"PLAYING": _("Playing"), "PAUSED_PLAYBACK": _("Paused"), "TRANSITIONING": _("Loading…")}.get(
+            st, _("Starting on the TV…"))
+        if s["kind"] == "intro" and st == "PLAYING":
+            text = _("Skynet is coming online")
+        if s.get("sub_loading"):
+            text = _("Loading subtitles…")
+        self._set_text(self.status_label, f"{text} - {self.tv.name}" if self.tv else text)
+        icon = "media-playback-pause-symbolic" if st == "PLAYING" else "media-playback-start-symbolic"
+        if icon != self.play_icon:
+            self.play_icon = icon
+            self.play_img.set_from_icon_name(icon, Gtk.IconSize.DND)
+
+    def _tick(self):
+        s = self.session
+        if s and not self.dragging:
+            pos = self.est_pos()
+            if self.tv_dur and self.tv_dur != self.range_dur:
+                self.range_dur = self.tv_dur
+                self.scale.set_range(0, self.tv_dur)
+                self.total.set_text(fmt(self.tv_dur))
+            self.scale.set_sensitive(bool(self.tv_dur))
+            self.scale.set_value(pos)
+            self._set_text(self.elapsed, fmt(pos))
+        now = time.monotonic()
+        if s and s["kind"] == "movie" and s["seen_playing"] and now - self.last_save > 15:
+            self.last_save = now
+            self._remember(s["path"], pos=self.est_pos(), dur=self.tv_dur)
+        return True
+
+    def _session_finished(self):
+        s = self.session
+        if s["kind"] == "intro" and s["next"]:
+            path, start_at, subtitle, subs = s["next"]
+            self.session = None
+            self._start_session("movie", path, start_at, subtitle=subtitle, subs_on=bool(subtitle), subs=subs)
+        else:
+            self._end_session(stop_tv=False)
+
+    def _end_session(self, stop_tv=True):
+        s, self.session = self.session, None
+        if not s:
+            return
+        self.poller.active = False
+        self.gen += 1
+        if s["kind"] == "movie" and s["seen_playing"]:
+            pos, dur = self.est_pos(), self.tv_dur
+            watched = bool(dur) and (pos >= dur - 90 or pos >= dur * 0.95)
+            self._remember(s["path"], pos=0 if watched else pos, dur=dur, watched=watched)
+        if stop_tv and self.tv:
+            self.worker.submit(self.tv.stop)
+        self.preview.unload()
+        self.hold = None
+        self.skip_intro_btn.hide()
+        self.sub_button.hide()
+        self.sub_popover.popdown()
+        self.stack.set_visible_child_name("pick")
+        self._update_video_area()
+        self._refresh_recent()
+
+    def toggle_play(self):
+        if not (self.session and self.tv):
+            return
+        if self.tv_state == "PLAYING":
+            self.tv_pos, self.tv_state = self.est_pos(), "PAUSED_PLAYBACK"
+            self.worker.submit(self.tv.pause, done=lambda _r: self.poller.wake.set())
+        else:
+            self.tv_state, self.pos_seen = "PLAYING", time.monotonic()
+            self.worker.submit(self.tv.play, done=lambda _r: self.poller.wake.set())
+        self._update_status()
+        self._sync_preview()
+
+    def seek_to(self, target):
+        if not (self.session and self.tv):
+            return
+        dur = self.tv_dur
+        target = max(0.0, min(target, dur - 2) if dur else target)
+        self.hold = (target, time.monotonic(), 8.0)
+        self.worker.submit(self.tv.seek, target, done=lambda _r: self.poller.wake.set())
+        if self.preview.path:
+            self.preview.seek(target)
+        self._tick()
+
+    def skip(self, delta):
+        self.seek_to(self.est_pos() + delta)
+
+    def skip_intro(self):
+        if self.session and self.session["kind"] == "intro":
+            self._session_finished()
+
+    def stop(self):
+        if not self.session:  # still preparing (subtitles / intro): just go back
+            self.gen += 1
+            self.stack.set_visible_child_name("pick")
+            return
+        self._end_session(stop_tv=True)
+
+    # ------------------------------------------------------------ subtitles
+
+    def _sub_name(self, entry):
+        return _(entry["lang"]) if entry.get("lang") else shorten(entry["label"], 24)
+
+    def _update_sub_button(self):
+        s = self.session
+        if not s or s["kind"] != "movie":
+            return
+        if s.get("sub_loading"):
+            text = _("Subtitles: loading…")
+        elif s["sub_tv_changed"]:
+            text = _("Subtitles: set on the TV")
+        elif s["sub_on"] and s["sub_entry"]:
+            text = _("Subtitles: {name}").format(name=self._sub_name(s["sub_entry"]))
+        elif s["subs"] is None:
+            text = _("Subtitles")
+        elif not any(e["ok"] for e in s["subs"]):
+            text = _("Subtitles: none")
+        else:
+            text = _("Subtitles: off")
+        self._set_text(self.sub_label, text)
+
+    def _fill_sub_menu(self):
+        for child in self.sub_menu.get_children():
+            child.destroy()
+        s = self.session
+        title = Gtk.Label(xalign=0, margin_bottom=4)
+        title.set_markup(f"<b>{GLib.markup_escape_text(_('Subtitles'))}</b>")
+        self.sub_menu.pack_start(title, False, False, 0)
+        if not s or s["kind"] != "movie":
+            return
+        if s["subs"] is None:
+            row = Gtk.Box(spacing=8)
+            spin = Gtk.Spinner(active=True)
+            row.pack_start(spin, False, False, 0)
+            row.pack_start(Gtk.Label(label=_("Looking for subtitles…")), False, False, 0)
+            self.sub_menu.pack_start(row, False, False, 4)
+        else:
+            current = None if s["sub_tv_changed"] else (s["sub_entry"]["id"] if s["sub_entry"] and s["sub_on"] else "off")
+            options = [(None, _("Off"))] + [(e, shorten(e["label"])) for e in s["subs"] if e["ok"]]
+            for entry, label in options:
+                b = Gtk.ModelButton(text=label, role=Gtk.ButtonRole.RADIO,
+                                    active=(entry["id"] if entry else "off") == current)
+                b.connect("clicked", lambda _b, e=entry: self._pick_subtitle(e))
+                self.sub_menu.pack_start(b, False, False, 0)
+            for e in s["subs"]:
+                if not e["ok"]:
+                    lbl = Gtk.Label(label=f"{shorten(e['label'], 40)} - {e['why']}", xalign=0, margin_start=8,
+                                    wrap=True, max_width_chars=50)
+                    lbl.get_style_context().add_class("dim-label")
+                    self.sub_menu.pack_start(lbl, False, False, 2)
+            if not s["subs"]:
+                lbl = Gtk.Label(label=_("No subtitles found next to this video or inside it."), xalign=0,
+                                wrap=True, max_width_chars=50)
+                lbl.get_style_context().add_class("dim-label")
+                self.sub_menu.pack_start(lbl, False, False, 4)
+        self.sub_menu.pack_start(Gtk.Separator(), False, False, 6)
+        pick = Gtk.ModelButton(text=_("Choose a subtitle file…"))
+        pick.connect("clicked", lambda *_a: GLib.idle_add(self._choose_sub_file))
+        self.sub_menu.pack_start(pick, False, False, 0)
+        notes = []
+        if s["sub_tv_changed"]:
+            notes.append(_("Subtitles were changed with the TV remote. The TV doesn't tell the PC what's on, "
+                           "so pick an option here to set them from the PC."))
+        if s["caption_api"] is False:
+            notes.append(_("This TV can't switch subtitles on command, so OpusCast restarts the video "
+                           "with the subtitles you pick."))
+        else:
+            notes.append(_("Subtitles not showing? The TV's own subtitle setting may be off. Turn subtitles on "
+                           "once with the TV remote - the PC can't change that setting."))
+        if core.check_deps()[3]:
+            notes.append(_("Subtitles built into videos need ffmpeg:") + " " + core.install_hint(["subs"]))
+        for n in notes:
+            lbl = Gtk.Label(label=n, xalign=0, wrap=True, max_width_chars=50, margin_top=6)
+            lbl.get_style_context().add_class("dim-label")
+            self.sub_menu.pack_start(lbl, False, False, 0)
+        self.sub_menu.show_all()
+
+    def _pick_subtitle(self, entry):
+        self.sub_popover.popdown()
+        s = self.session
+        if not s or s["kind"] != "movie":
+            return
+        s["sub_tv_changed"] = False
+        self._remember(s["path"], sub=entry["id"] if entry else None)
+        if s["caption_api"] is False:  # this TV only takes subtitles with the video: restart with them
+            if entry is None and not s["sub_entry"]:
+                s["sub_on"] = False
+                self._update_sub_button()
+            elif entry is not None and s["sub_entry"] and s["sub_entry"]["id"] == entry["id"]:
+                s["sub_on"] = True
+                self._update_sub_button()
+            else:
+                self._restart_with(entry)
+            return
+        if entry is None or entry["id"] in s["paths"]:
+            self._show_sub(s, entry)
+            return
+        s["sub_loading"] = True  # extract / convert it first (cached after the first time)
+        self._update_sub_button()
+        self._update_status()
+
+        def work():
+            try:
+                data = core.prepare_subtitle(entry, s["path"])
+            except core.TVError as e:
+                GLib.idle_add(self._sub_failed, s["gen"], str(e))
+                return
+            GLib.idle_add(self._sub_prepared, s, entry, data)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _sub_prepared(self, s, entry, data):
+        if s is self.session:
+            s["paths"][entry["id"]] = self.server.add_subtitle(s["media"], data)
+            self._show_sub(s, entry)
+        return False
+
+    def _show_sub(self, s, entry):
+        """Switch the TV to this subtitle (None: the empty file, i.e. off) without restarting the video."""
+        s["sub_loading"] = True
+        self._update_sub_button()
+        self.last_caption_cmd = time.monotonic()
+        path = s["paths"][entry["id"]] if entry else None
+        self.worker.submit(core.show_subtitle, self.tv, self.server, s["media"], path,
+                           done=lambda r, sess=s, e=entry: self._sub_shown(sess, e, r))
+
+    def _sub_shown(self, s, entry, result):
+        if s is not self.session:
+            return
+        s["sub_loading"] = False
+        if result != "ok":  # not a Samsung after all: the TV needs the subtitle announced with the video
+            s["caption_api"] = False
+            self._restart_with(entry)
+            return
+        s["caption_api"], s["sub_on"] = True, entry is not None
+        if entry:
+            s["sub_entry"] = entry
+        self._update_sub_button()
+        self._update_status()
+
+    def _restart_with(self, entry):
+        """Start the video again from here with a different subtitle (the TV needs it announced up front)."""
+        s = self.session
+        gen = s["gen"]
+        s["sub_loading"] = True
+        self._update_sub_button()
+        self._update_status()
+
+        def work():
+            try:
+                data = core.prepare_subtitle(entry, s["path"]) if entry else None
+            except core.TVError as e:
+                GLib.idle_add(self._sub_failed, gen, str(e))
+                return
+            GLib.idle_add(self._sub_ready, gen, entry, data)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _sub_ready(self, gen, entry, data):
+        s = self.session
+        if s and s["gen"] == gen:
+            self._start_session("movie", s["path"], self.est_pos(), subtitle=(entry, data) if entry else None,
+                                subs_on=entry is not None, subs=s["subs"])
+        return False
+
+    def _sub_failed(self, gen, message):
+        s = self.session
+        if s and s["gen"] == gen:
+            s["sub_loading"] = False
+            self._update_sub_button()
+            self.show_info(_("Couldn't use those subtitles: {error}").format(error=message), WARNING)
+        return False
+
+    def _choose_sub_file(self):
+        s = self.session
+        if not s or s["kind"] != "movie":
+            return False
+        dlg = Gtk.FileChooserNative.new(_("Choose a subtitle file"), self, Gtk.FileChooserAction.OPEN,
+                                        _("_Use"), _("_Cancel"))
+        flt = Gtk.FileFilter()
+        flt.set_name(_("Subtitles"))
+        for ext in core.SUB_EXTS:
+            flt.add_pattern("*" + ext)
+            flt.add_pattern("*" + ext.upper())
+        dlg.add_filter(flt)
+        dlg.set_current_folder(os.path.dirname(s["path"]))
+        response = dlg.run()
+        path = dlg.get_filename()
+        dlg.destroy()
+        if response == Gtk.ResponseType.ACCEPT and path:
+            self._use_sub_file(path)
+        return False
+
+    def _use_sub_file(self, path):
+        s = self.session
+        if not s:
+            return
+        entry = core.subtitle_file_entry(path)
+        if s["subs"] is not None and not any(e["id"] == entry["id"] for e in s["subs"]):
+            s["subs"].append(entry)
+        self._pick_subtitle(entry)
+
+    def _cycle_subtitles(self):
+        """S key: off -> last/first subtitle -> off."""
+        s = self.session
+        if not s or s["kind"] != "movie" or not s["subs"]:
+            return
+        if s["sub_on"] and not s["sub_tv_changed"]:
+            self._pick_subtitle(None)
+            return
+        usable = [e for e in s["subs"] if e["ok"]]
+        entry = s["sub_entry"] or core.auto_subtitle(usable)
+        if entry:
+            self._pick_subtitle(entry)
+
+    # ------------------------------------------------------------ seek bar & volume
+
+    def _on_scale_press(self, *_args):
+        self.dragging, self.drag_value = True, None
+        return False
+
+    def _on_scale_release(self, *_args):
+        self.dragging = False
+        if self.drag_value is not None:
+            value, self.drag_value = self.drag_value, None
+            self.seek_to(value)
+        return False
+
+    def _on_scale_change(self, _scale, _scroll, value):
+        if not self.session:
+            return True
+        value = max(0.0, min(value, self.tv_dur or value))
+        self._set_text(self.elapsed, fmt(value))
+        if self.dragging:
+            self.drag_value = value
+            now = time.monotonic()
+            if self.preview.path and now - self.last_scrub > 0.12:
+                self.last_scrub = now
+                self.preview.seek(value, accurate=False)
+        else:
+            if self.seek_timer:
+                GLib.source_remove(self.seek_timer)
+            self.seek_timer = GLib.timeout_add(350, self._debounced_seek, value)
+        return False
+
+    def _debounced_seek(self, value):
+        self.seek_timer = None
+        self.seek_to(value)
+        return False
+
+    def _on_volume(self, _button, value):
+        if self.setting_vol or not self.tv:
+            return
+        self.vol_touched = time.monotonic()
+        if self.vol_timer:
+            GLib.source_remove(self.vol_timer)
+        self.vol_timer = GLib.timeout_add(150, self._send_volume, int(round(value * 100)))
+
+    def _send_volume(self, value):
+        self.vol_timer = None
+        self.worker.submit(self.tv.set_volume, value)
+        return False
+
+    # ------------------------------------------------------------ preview
+
+    def _on_preview_toggled(self, switch, _pspec):
+        on = switch.get_active()
+        if on and not self.preview.ok:
+            switch.set_active(False)
+            missing = core.check_deps()[1] or ["gst-gtk"]
+            self.show_info(_("“Show on PC” needs more GStreamer parts ({reason}). Install them with:").format(
+                reason=self.preview.reason), WARNING, selectable=core.install_hint(missing))
+            return
+        self.cfg["preview"] = on
+        self._save()
+        if on and self.session:
+            self._preview_load()
+        elif not on:
+            self.preview.unload()
+        self._update_video_area()
+
+    def _update_video_area(self):
+        show = bool(self.session) and self.preview_switch.get_active() and self.preview.ok
+        self.video_box.set_visible(show)
+        self.placeholder.set_visible(not show)
+        if show:
+            self.preview.widget.show()
+            w, h = self.get_size()
+            if h < 760 and not self.is_maximized():
+                self.resize(max(w, 900), 820)
+
+    def _preview_load(self):
+        self._update_video_area()
+        if self.session and self.preview.ok:
+            GLib.idle_add(self._preview_load_now, self.session["gen"])
+
+    def _preview_load_now(self, gen):
+        s = self.session
+        if s and s["gen"] == gen and self.preview_switch.get_active():
+            self.preview.load(s["path"], self.est_pos())
+            self._sync_preview()
+        return False
+
+    def _sync_preview(self):
+        p, s = self.preview, self.session
+        if not (s and p.path == s["path"]):
+            return
+        want = self.tv_state == "PLAYING" and s["seen_playing"] and not self.hold and not self.dragging
+        p.set_playing(want)
+        if self.dragging:
+            return
+        here = p.position()
+        if here is None:
+            return
+        target = self.est_pos()
+        if abs(here - target) > (1.5 if want else 0.3):
+            p.seek(target)
+
+    def _swap_preview_widget(self, old, new):
+        self.video_box.remove(old)
+        self.video_box.add(new)
+        new.show()
+
+    def _on_preview_error(self, message):
+        missing = core.check_deps()[1]
+        if not missing and ("plug-in" in message or "plugin" in message.lower()):
+            missing = ["gst-libav", "gst-good"]
+        self.preview_switch.set_active(False)
+        self.show_info(_("The PC preview can't play this video ({error}). The TV isn't affected.").format(
+            error=message), WARNING, selectable=core.install_hint(missing) if missing else None)
+
+    # ------------------------------------------------------------ misc
+
+    def _on_intro_toggled(self, switch, _pspec):
+        on = switch.get_active()
+        if on:
+            ok, reason = intro.available()
+            if not ok:
+                switch.set_active(False)
+                self.show_info(_("The Skynet intro {reason}. Install with:").format(reason=reason), WARNING,
+                               selectable=core.install_hint(["intro"]))
+                return
+            if not intro.cached_path():  # render it now so the first play starts right away
+                threading.Thread(target=lambda: self._quietly(intro.ensure_intro), daemon=True).start()
+        self.cfg["intro"] = on
+        self._save()
+
+    @staticmethod
+    def _quietly(fn, *args, **kw):
+        try:
+            fn(*args, **kw)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_worker_error(self, error):
+        s = self.session
+        if s and s.get("sub_loading"):
+            s["sub_loading"] = False
+            self._update_sub_button()
+        if s and not s["seen_playing"]:
+            self._end_session(stop_tv=False)
+            self.show_info(_("Couldn't start the video on the TV: {error}").format(error=error), ERROR)
+        else:
+            self.show_info(_("The TV didn't accept that: {error}").format(error=error), WARNING)
+        return False
+
+    def _on_key(self, _w, ev):
+        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+        shift = ev.state & Gdk.ModifierType.SHIFT_MASK
+        k = ev.keyval
+        if ctrl and k in (Gdk.KEY_o, Gdk.KEY_O):
+            self.choose_file()
+            return True
+        if not self.session or ctrl or self.dev_button.get_active() or self.sub_button.get_active():
+            return False
+        if k == Gdk.KEY_space:
+            self.toggle_play()
+        elif k in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.skip((30 if shift else 10) * (1 if k == Gdk.KEY_Right else -1))
+        elif k in (Gdk.KEY_Up, Gdk.KEY_Down):
+            step = 0.05 if k == Gdk.KEY_Up else -0.05
+            self.volume.set_value(min(1.0, max(0.0, self.volume.get_value() + step)))
+        elif k in (Gdk.KEY_p, Gdk.KEY_P):
+            self.preview_switch.set_active(not self.preview_switch.get_active())
+        elif k in (Gdk.KEY_s, Gdk.KEY_S):
+            self._cycle_subtitles()
+        else:
+            return False
+        return True
+
+    def _save(self):
+        try:
+            core.save_config(self.cfg)
+        except OSError:
+            pass
+
+    def _on_close(self, *_args):
+        s, tv = self.session, self.tv
+        sids = dict(self.event_sids)
+
+        def shutdown():
+            if s:
+                self._quietly(tv.stop, timeout=2.5)
+            for service, sid in sids.items():
+                tv.unsubscribe(service, sid)
+        if s:
+            self._end_session(stop_tv=False)
+        if tv:
+            t = threading.Thread(target=shutdown, daemon=True)
+            t.start()
+            t.join(4)
+        self.preview.unload()
+        self._save()
+        self.server.close()
+        return False
+
+
+class OpusCastApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=core.APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        self.win = None
+
+    def do_activate(self):
+        if not self.win:
+            try:
+                self.win = OpusCastWindow(self)
+            except core.TVError as e:
+                dlg = Gtk.MessageDialog(message_type=ERROR, buttons=Gtk.ButtonsType.CLOSE,
+                                        text=_("{app} can't start").format(app=core.APP_NAME), secondary_text=str(e))
+                dlg.run()
+                dlg.destroy()
+                return
+        self.win.present()
+
+    def do_open(self, files, _n_files, _hint):
+        self.do_activate()
+        for f in files:
+            path = f.get_path()
+            if path and self.win:
+                self.win.play_file(path)
+                break
+
+
+def main():
+    GLib.set_prgname("opuscast")
+    GLib.set_application_name(core.APP_NAME)
+    Gtk.Window.set_default_icon_name(core.APP_ID)
+    sys.exit(OpusCastApp().run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()

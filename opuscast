@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""opuscast - play a video from this PC on your TV (command-line OpusCast).
+
+  opuscast VIDEO                  play it on the TV (Ctrl+C stops)
+  opuscast VIDEO --from 1:02:30   start part-way through
+  opuscast VIDEO --sub auto       with subtitles (auto, a file, or a track number from --subs)
+  opuscast VIDEO --subs           list the subtitles found for the video
+  opuscast VIDEO --intro          Skynet boot intro first
+  opuscast --list                 show devices on the network and which can play video
+  opuscast --stop                 stop whatever the TV is playing
+"""
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import opuscast_core as core  # noqa: E402
+from opuscast_i18n import _  # noqa: E402
+
+
+def states():
+    return {"PLAYING": _("playing"), "PAUSED_PLAYBACK": _("paused"), "STOPPED": _("stopped"),
+            "TRANSITIONING": _("loading"), "NO_MEDIA_PRESENT": _("idle"), "UNREACHABLE": _("not responding")}
+
+
+def wait_until_done(tv, server, media):
+    seen, last, start, warned = False, None, time.time(), False
+    names = states()
+    while True:
+        time.sleep(1)
+        if not media["requested"].is_set() and not warned and time.time() - start > 15:
+            warned = True
+            print(_("The TV hasn't loaded the video yet - a firewall on this PC may be blocking it.") + "\n"
+                  f"  ufw:       sudo ufw allow from {tv.host} to any port {server.port} proto tcp\n"
+                  f"  firewalld: sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 "
+                  f"source address={tv.host} port port={server.port} protocol=tcp accept' && sudo firewall-cmd --reload")
+        try:
+            state = tv.state()
+            uri = tv.position()[2]
+        except core.TVError:
+            state, uri = "UNREACHABLE", None
+        ours = not uri or media["url_path"] in uri
+        if state != last:
+            print(_("TV:"), names.get(state, state.lower()))
+            last = state
+        if state == "PLAYING" and ours:
+            seen = True
+        elif seen and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
+            return
+
+
+def parse_start(text):
+    if text is None:
+        return 0
+    if text.isdigit():
+        return int(text)
+    t = core.parse_time(text)
+    if t is None:
+        sys.exit(_("Can't read the time {time!r} - use e.g. 1:02:30, 45:00 or 300").format(time=text))
+    return t
+
+
+def list_devices():
+    print(_("Scanning the network..."))
+    for d in core.scan_network():
+        mark = "✓" if d["can_play"] else "✗"
+        detail = f" ({d['detail']})" if d["detail"] else ""
+        print(f" {mark} {d['ip']:15} {d['name']}{detail}\n{'':19}{d['note']}")
+
+
+def pick_subtitle(video, choice):
+    entries = core.list_subtitles(video)
+    if choice == "auto":
+        entry = core.auto_subtitle(entries)
+        if not entry:
+            print(_("No usable subtitles found - playing without."))
+        return entry
+    if choice.isdigit():
+        n = int(choice)
+        if 1 <= n <= len(entries):
+            entry = entries[n - 1]
+            if not entry["ok"]:
+                sys.exit(f"{entry['label']}: {entry['why']}")
+            return entry
+        sys.exit(_("There's no subtitle number {n} - see opuscast VIDEO --subs").format(n=n))
+    if os.path.isfile(choice):
+        return core.subtitle_file_entry(os.path.abspath(choice))
+    sys.exit(_("No such subtitle file: {path}").format(path=choice))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="opuscast", description=_("Play a video from this PC on your TV."))
+    ap.add_argument("file", nargs="?", help=_("video file to play"))
+    ap.add_argument("--tv", metavar="IP", help=_("TV address (default: the last TV used, or the first one found)"))
+    ap.add_argument("--from", dest="start", metavar="TIME", help=_("start at TIME, e.g. 1:02:30"))
+    ap.add_argument("--sub", metavar="WHICH", help=_("subtitles: auto, a subtitle file, or a number from --subs"))
+    ap.add_argument("--subs", action="store_true", help=_("list the subtitles found for the video"))
+    ap.add_argument("--intro", action="store_true", help=_("play the Skynet boot intro first"))
+    ap.add_argument("--list", action="store_true", help=_("show devices on the network and which can play video"))
+    ap.add_argument("--stop", action="store_true", help=_("stop playback on the TV and exit"))
+    a = ap.parse_args()
+
+    if a.list:
+        list_devices()
+        return
+    if not a.file and not a.stop:
+        ap.error(_("give a video file (or --list / --stop)"))
+    if a.file and not os.path.isfile(a.file):
+        sys.exit(_("No such file: {path}").format(path=a.file))
+    if a.subs:
+        entries = core.list_subtitles(os.path.abspath(a.file))
+        if not entries:
+            print(_("No subtitles found next to this video or inside it."))
+        for n, e in enumerate(entries, 1):
+            print(f" {n}. {e['label']}" + ("" if e["ok"] else f"  ({e['why']})"))
+        return
+    start_at = parse_start(a.start)
+    subtitle = None
+    if a.sub:
+        entry = pick_subtitle(os.path.abspath(a.file), a.sub)
+        if entry:
+            try:
+                subtitle = core.prepare_subtitle(entry, os.path.abspath(a.file))
+                print(_("Subtitles: {name}").format(name=entry["label"]))
+            except core.TVError as e:
+                print(_("Couldn't use those subtitles: {error}").format(error=e))
+
+    cfg = core.load_config()
+    tv = core.find_tv(location=(cfg.get("tv") or {}).get("location"), host=a.tv)
+    if not tv:
+        sys.exit(_("No TV found. Is it switched on and on the same network? (opuscast --list shows what's there)"))
+    cfg["tv"] = {"location": tv.location, "name": tv.name}
+    core.save_config(cfg)
+
+    if a.stop:
+        tv.stop()
+        print(_("Stopped."))
+        return
+
+    server = core.MediaServer()
+    try:
+        if a.intro:
+            import opuscast_intro
+            print(_("Skynet is booting…"))
+            wait_until_done(tv, server, core.start_playback(tv, server, opuscast_intro.ensure_intro()))
+        media = core.start_playback(tv, server, a.file, start_at, subtitle=subtitle, subs_on=subtitle is not None)
+        print(_("Playing on {tv}: {title}").format(tv=tv.name, title=media["title"]))
+        print(_("(keep this open while you watch - Ctrl+C stops)"))
+        wait_until_done(tv, server, media)
+        print(_("Finished."))
+    except KeyboardInterrupt:
+        try:
+            tv.stop(timeout=3)
+        except core.TVError:
+            pass
+        print("\n" + _("Stopped."))
+    except (core.TVError, RuntimeError, OSError) as e:
+        sys.exit(_("Error: {error}").format(error=e))
+    finally:
+        server.close()
+
+
+if __name__ == "__main__":
+    main()
