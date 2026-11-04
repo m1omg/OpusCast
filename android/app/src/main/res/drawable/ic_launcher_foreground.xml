@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A TV with a play sign and a red "on air" dot, from the desktop icon, sized for the 72 dp safe zone -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:scaleX="0.6" android:scaleY="0.6" android:translateX="15.6" android:translateY="16.2">
+        <path android:fillColor="#38FFFFFF"
+            android:pathData="M31,28h66a9,9 0,0 1,9 9v38a9,9 0,0 1,-9 9h-66a9,9 0,0 1,-9 -9v-38a9,9 0,0 1,9 -9z" />
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="6" android:fillColor="#00000000"
+            android:pathData="M31,28h66a9,9 0,0 1,9 9v38a9,9 0,0 1,-9 9h-66a9,9 0,0 1,-9 -9v-38a9,9 0,0 1,9 -9z" />
+        <path android:fillColor="#FFFFFFFF" android:pathData="M56,43L76,56L56,69Z" />
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="7" android:strokeLineCap="round"
+            android:pathData="M46,98H82" />
+        <path android:fillColor="#FFFF3B3B" android:pathData="M96,38m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+    </group>
+</vector>
