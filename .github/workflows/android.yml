@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -44,6 +44,10 @@ jobs:
           OPUSCAST_KEY_ALIAS: ${{ secrets.OPUSCAST_KEY_ALIAS }}
           OPUSCAST_KEY_PASSWORD: ${{ secrets.OPUSCAST_KEY_PASSWORD }}
         run: ./gradlew assembleRelease lintRelease
+
+      - name: Lint findings
+        if: always()
+        run: cat app/build/reports/lint-results-release.txt 2>/dev/null || echo "no lint report"
 
       - uses: actions/upload-artifact@v4
         with:
