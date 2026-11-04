@@ -54,6 +54,9 @@ android {
     }
     lint {
         abortOnError = false
+        // findings go to the build log too (the HTML report is in the "reports" CI artifact)
+        textReport = true
+        textOutput = file("stdout")
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
