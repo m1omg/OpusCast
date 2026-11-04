@@ -1,6 +1,7 @@
 package io.github.m1omg.opuscast
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.Context
 import android.content.pm.PackageManager
@@ -47,6 +48,8 @@ private const val EXTERNAL = "com.android.externalstorage.documents"
 private const val DOWNLOADS = "com.android.providers.downloads.documents"
 
 object Subs {
+    /** A path some providers report (e.g. "/sdcard/Movies/A.mkv") -> where it is. Parses, doesn't open. */
+    @SuppressLint("SdCardPath")
     private fun placeFromPath(path: String): Place? {
         val p = File(path).absoluteFile.parent ?: return null
         val primary = Environment.getExternalStorageDirectory().absolutePath

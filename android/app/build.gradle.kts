@@ -53,7 +53,7 @@ android {
         compose = true
     }
     lint {
-        abortOnError = false
+        abortOnError = true // errors fail the build; warnings are only reported
         // a plain-text report next to the HTML one (CI prints it in the build log)
         textReport = true
     }

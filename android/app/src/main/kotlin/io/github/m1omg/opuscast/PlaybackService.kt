@@ -37,6 +37,8 @@ class PlaybackService : Service() {
         private const val ACTION_BACK = "io.github.m1omg.opuscast.BACK"
         private const val ACTION_FORWARD = "io.github.m1omg.opuscast.FORWARD"
         private const val ACTION_STOP = "io.github.m1omg.opuscast.STOP"
+        /** Long enough for any film; renewed whenever a video starts, released when playback ends. */
+        private const val WAKE_MS = 6 * 60 * 60 * 1000L
 
         fun start(context: Context) {
             try {
@@ -87,7 +89,7 @@ class PlaybackService : Service() {
             isActive = true
         }
         val pm = getSystemService(PowerManager::class.java)
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpusCast:serving").apply { setReferenceCounted(false); acquire() }
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpusCast:serving").apply { setReferenceCounted(false); acquire(WAKE_MS) }
         val wifi = applicationContext.getSystemService(WifiManager::class.java)
         @Suppress("DEPRECATION")
         val modes = listOfNotNull(WifiManager.WIFI_MODE_FULL_HIGH_PERF, if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else null)
@@ -103,6 +105,7 @@ class PlaybackService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // every startForegroundService() must be answered with startForeground()
         goForeground(shownTitle ?: getString(R.string.app_name), shownPlaying ?: false)
+        runCatching { wakeLock?.acquire(WAKE_MS) } // a new video: the full time again
         when (intent?.action) {
             ACTION_TOGGLE -> engine.togglePlay()
             ACTION_BACK -> engine.skip(-10.0)

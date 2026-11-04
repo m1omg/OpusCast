@@ -28,7 +28,6 @@
     <string name="enter_address">Televízor tu nie je? Zadajte jeho adresu</string>
     <string name="address_hint">napr. 192.168.1.50</string>
     <string name="connect">Pripojiť</string>
-    <string name="cancel">Zrušiť</string>
     <string name="no_tv_at">Na adrese %1$s neodpovedá žiadny televízor.</string>
     <string name="no_wifi">Telefón nie je pripojený k Wi‑Fi. Pripojte ho k rovnakej Wi‑Fi ako televízor.</string>
     <string name="pick_title">Prehrajte video v televízore</string>
@@ -61,7 +60,6 @@
     <string name="try_again">Skúsiť znova</string>
     <string name="cant_read_file">Súbor sa nedá prečítať: %1$s</string>
     <string name="cant_open_anymore">OpusCast už toto video nevie otvoriť. Vyberte ho znova.</string>
-    <string name="not_a_video">Toto nevyzerá ako video.</string>
     <string name="couldnt_start">Video sa v televízore nepodarilo spustiť: %1$s</string>
     <string name="tv_didnt_accept">Televízor to neprijal: %1$s</string>
     <string name="intro_failed">Úvod Skynet zlyhal (%1$s) – video sa spustí hneď.</string>

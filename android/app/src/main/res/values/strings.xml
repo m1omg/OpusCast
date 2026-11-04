@@ -29,7 +29,6 @@
     <string name="enter_address">TV not listed? Enter its address</string>
     <string name="address_hint">e.g. 192.168.1.50</string>
     <string name="connect">Connect</string>
-    <string name="cancel">Cancel</string>
     <string name="no_tv_at">No TV answered at %1$s.</string>
     <string name="no_wifi">This phone isn\'t on a Wi-Fi network. Connect to the same Wi-Fi as the TV.</string>
     <string name="pick_title">Play a video on your TV</string>
@@ -62,7 +61,6 @@
     <string name="try_again">Try again</string>
     <string name="cant_read_file">Can\'t read that file: %1$s</string>
     <string name="cant_open_anymore">OpusCast can\'t open this video any more. Choose it again.</string>
-    <string name="not_a_video">That doesn\'t look like a video.</string>
     <string name="couldnt_start">Couldn\'t start the video on the TV: %1$s</string>
     <string name="tv_didnt_accept">The TV didn\'t accept that: %1$s</string>
     <string name="intro_failed">The Skynet intro failed (%1$s) - playing the video straight away.</string>

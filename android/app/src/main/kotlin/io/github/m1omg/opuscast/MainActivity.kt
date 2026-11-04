@@ -118,18 +118,16 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val state = engine.ui.value
-        val code = event.keyCode
-        if (event.isCtrlPressed && code == KeyEvent.KEYCODE_O) {
+        if (event.isCtrlPressed && keyCode == KeyEvent.KEYCODE_O) {
             actions.chooseVideo()
             return true
         }
-        if (!state.sessionActive || !playerKeys || event.isCtrlPressed) return super.dispatchKeyEvent(event)
-        when (code) {
-            KeyEvent.KEYCODE_VOLUME_UP -> if (state.volume != null) engine.volumeStep(5) else return super.dispatchKeyEvent(event)
-            KeyEvent.KEYCODE_VOLUME_DOWN -> if (state.volume != null) engine.volumeStep(-5) else return super.dispatchKeyEvent(event)
+        if (!state.sessionActive || !playerKeys || event.isCtrlPressed) return super.onKeyDown(keyCode, event)
+        when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> if (state.volume != null) engine.volumeStep(5) else return super.onKeyDown(keyCode, event)
+            KeyEvent.KEYCODE_VOLUME_DOWN -> if (state.volume != null) engine.volumeStep(-5) else return super.onKeyDown(keyCode, event)
             KeyEvent.KEYCODE_SPACE, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> engine.togglePlay()
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MEDIA_REWIND -> engine.skip(if (event.isShiftPressed) -30.0 else -10.0)
             KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> engine.skip(if (event.isShiftPressed) 30.0 else 10.0)
@@ -138,7 +136,7 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_S -> engine.cycleSubtitles()
             KeyEvent.KEYCODE_P -> engine.setPreview(!state.previewOn)
             KeyEvent.KEYCODE_MEDIA_STOP -> engine.stop()
-            else -> return super.dispatchKeyEvent(event)
+            else -> return super.onKeyDown(keyCode, event)
         }
         return true
     }
