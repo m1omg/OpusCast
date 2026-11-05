@@ -1,10 +1,11 @@
 # OpusCast for Android
 
-Play videos from your phone on your smart TV. It's the same idea as OpusCast on Linux: no app on the TV,
-no server to set up. The phone hands the file to the TV over your Wi‑Fi (DLNA / UPnP), so the
-**TV remote works** for pause, rewind and volume.
+Play videos, music and photos from your phone on your smart TV, or show the phone's screen on it.
+It's the same idea as OpusCast on Linux: no app on the TV, no server to set up. The phone hands the
+file to the TV over your Wi‑Fi (DLNA / UPnP), so the **TV remote works** for pause, rewind and volume.
 
-- **Choose a video**, or use *Share → OpusCast* / *Open with → OpusCast* from a file manager or gallery.
+- **Choose a video, music or photos**, or use *Share → OpusCast* / *Open with → OpusCast* from a file
+  manager, gallery or music app.
 - **Picks up where you left off.** Recent videos remember their position and their subtitles.
 - **Subtitles:**
   - Text subtitles inside MKV, WebM and MP4 videos are read straight from the file.
@@ -16,16 +17,34 @@ no server to set up. The phone hands the file to the TV over your Wi‑Fi (DLNA 
   - On Samsung TVs subtitles switch instantly; other TVs restart the video at the same spot.
 - **Show on phone:** a muted copy of the video on the phone, kept in step with the TV. Drag the seek
   bar and you see where you're jumping before you let go.
-- **The phone's volume buttons set the TV's volume** while a video plays. Lock-screen and
+- **Music:** pick one song or several; they play one after another with the album cover, artist and
+  album on the TV and on the lock screen. Next / Previous on the phone, in the notification and on
+  Bluetooth headphones. Speakers that play music over DLNA (Sonos, Denon/HEOS, Yamaha MusicCast…) can
+  be picked for music too.
+- **Photos:** pick one or many and flip through them on the TV - swipe or tap Next - or let the
+  slideshow run (3 to 30 seconds a photo). HEIC photos from the camera (Android 9+), WebP and photos that are
+  only turned by their EXIF tag are converted to an upright JPEG the TV can show; very large photos
+  are scaled to 4K.
+- **Cast phone screen:** the TV shows what's on the phone's screen, with the sound apps play
+  (Android 10+, after you allow recording audio - it's only used for the apps' sound). Android asks
+  every time whether to share the screen. Expect the TV to be a couple of seconds behind; choose
+  720p in the options bar if your Wi‑Fi struggles.
+- **The phone's volume buttons set the TV's volume** while something plays. Lock-screen and
   Bluetooth media controls work too.
-- **Device list:** shows which devices on your network can play video, which are audio only, and
+- **Device list:** shows which devices on your network can play video, which play music only, and
   which can't play anything. If your TV isn't listed, type its address.
 - **Skynet intro (fun mode):** the same boot animation as on Linux. The phone draws and encodes it
   the first time you switch it on (this takes a little while), then keeps it.
 - English and Slovak, following the phone's language (Android 13+: per-app language in Settings).
 
-Needs Android 8.0 or newer. Tested with a Samsung QLED (Tizen). Most smart TVs that can play videos
-from the network should work.
+Needs Android 8.0 or newer. Tested with a Samsung QLED (Tizen). OpusCast reads each TV's list of the
+formats it plays and names them the way that TV does, so LG, Sony, Philips, Panasonic, Hisense, TCL and
+other DLNA TVs (also ones with Android TV / Google TV built in) should work as well.
+
+- **Philips:** the TV's DLNA player must be on: *All Settings → Wireless and Networks → Wired or
+  Wi‑Fi → Digital Media Renderer - DMR* (it's on unless someone switched it off).
+- **Chromecast, Google TV Streamer, Nvidia Shield** and other streaming sticks and boxes speak only
+  Google Cast, which OpusCast doesn't use, so they don't show up as TVs.
 
 ## Install
 
@@ -62,12 +81,17 @@ Android shows an app only the files you pick. To let OpusCast find subtitle file
   some routers keep Wi‑Fi devices apart, and a VPN on the phone can get in the way.
 - The TV does the decoding, so what plays depends on the TV. Samsung TVs don't support Dolby Vision;
   such files may not play. Picture-based subtitles (Blu‑ray PGS, DVD VobSub) can't be sent to a TV.
+  Some TVs don't play every music format (Opus and Ogg especially); MP3, AAC/M4A and FLAC are safe.
+- Screen casting: apps can forbid having their sound recorded (some streaming apps do); their sound
+  then stays on the phone. Notifications and other private content may be hidden by Android while
+  the screen is shared.
 
 ## Build
 
 The app needs the Android SDK (`./gradlew assembleRelease` in this folder, or open it in Android Studio).
-The part that talks to the TV, serves the file and handles subtitles is plain Kotlin in `core/`, with
-tests that run on any JDK 17+:
+The part that talks to the TV, serves the file, handles subtitles and muxes the screen stream into
+MPEG-TS is plain Kotlin in `core/`, with tests that run on any JDK 17+ (with ffmpeg installed, the
+muxer's output is also decoded by ffmpeg as a check):
 
 ```sh
 ./gradlew -p core test

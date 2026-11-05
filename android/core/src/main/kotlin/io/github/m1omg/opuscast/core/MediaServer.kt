@@ -134,7 +134,9 @@ class Media internal constructor(
     @Volatile var coverPath: String? = null
     /** Length announced to the TV up front, when known (music). */
     @Volatile var knownDurationMs: Long? = null
-    val title get() = source.title
+    /** The title from the song's tags, shown instead of the file name. */
+    @Volatile var tagTitle: String? = null
+    val title get() = tagTitle ?: source.title
     @Volatile private var duration: Long? = null
     @Volatile private var durationKnown = false
 
