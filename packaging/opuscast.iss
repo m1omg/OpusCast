@@ -19,6 +19,7 @@ OutputBaseFilename=OpusCast-Setup
 SetupIconFile=..\data\opuscast.ico
 Compression=lzma2
 SolidCompression=yes
+LZMANumBlockThreads=4
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

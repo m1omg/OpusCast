@@ -45,6 +45,7 @@ jobs:
   windows:
     needs: intro
     runs-on: windows-latest
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -73,10 +74,14 @@ jobs:
         run: PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py
       - name: Try casting the desktop against the fake TV
         continue-on-error: true  # the runner's desktop session may not allow screen grabs
-        run: PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py --desktop
+        run: |
+          echo "--- can ffmpeg grab this runner's screen at all?"
+          build-extra/ffmpeg/ffmpeg.exe -hide_banner -f gdigrab -framerate 30 -i desktop -t 2 -f null - 2>&1 | tail -8 || true
+          PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py --desktop
       - name: Build the app
         run: pyinstaller --noconfirm --log-level WARN packaging/opuscast.spec
       - name: Try the app
+        timeout-minutes: 5
         env:
           QT_QPA_PLATFORM: offscreen
           OPUSCAST_SELFTEST_OUT: ${{ runner.temp }}/selftest.json
@@ -86,6 +91,7 @@ jobs:
           cat "$OPUSCAST_SELFTEST_OUT"
           python -c "import json,sys; r=json.load(open(sys.argv[1])); assert r['ffmpeg'] and r['ffprobe'] and r['preview'] and r['intro'] and r['encoder'], r" "$OPUSCAST_SELFTEST_OUT"
       - name: Installer
+        timeout-minutes: 20
         run: |
           choco install innosetup -y --no-progress > /dev/null
           version=$(python -c "import opuscast_core as c; print(c.APP_VERSION)")
@@ -103,6 +109,7 @@ jobs:
   macos:
     needs: intro
     runs-on: macos-14
+    timeout-minutes: 45
     env:
       PY: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
     steps:

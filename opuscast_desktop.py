@@ -665,7 +665,11 @@ class DesktopCast:
                 self._log = (self._log + [text])[-12:]
 
     def _why(self):
-        return self._log[-1] if self._log else None
+        """ffmpeg's own reason: its last lines are often just "Error opening input files", the line
+        before says what really failed."""
+        generic = re.compile(r"^(Error opening (input|output)|Conversion failed|Error while|\[(in|out)#\d)", re.I)
+        specific = [line for line in self._log if not generic.match(line)]
+        return (specific or self._log or [None])[-1]
 
     def _fail(self, done, message):
         self.stop()
