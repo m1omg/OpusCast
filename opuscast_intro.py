@@ -14,12 +14,13 @@ import threading
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import opuscast_core  # noqa: E402
 from opuscast_i18n import _  # noqa: E402
 
 VERSION = 1
 W, H, FPS, DURATION = 1920, 1080, 30, 9.0
 _render_lock = threading.Lock()
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "opuscast")
+CACHE_DIR = opuscast_core.CACHE_DIR
 
 SUBTITLE = "NEURAL NET-BASED ARTIFICIAL INTELLIGENCE"
 FOOTER = "• CYBERDYNE SYSTEMS CORPORATION •"
@@ -44,8 +45,18 @@ Y_DEPTH, Y_GAP, Y_STEM = 0.65, 0.085, 0.09
 FLICKER = [(0.0, 1), (0.05, 0), (0.12, 1), (0.16, 0), (0.30, 1), (0.34, 0), (0.38, 1), (0.52, 0), (0.56, 1)]
 
 
+def bundled_path():
+    """The Windows and macOS apps carry the finished intro (no pycairo there): next to this file,
+    or in the app bundle."""
+    here = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.realpath(__file__))
+    p = os.path.join(here, f"skynet-intro-v{VERSION}.mp4")
+    return p if os.path.exists(p) else None
+
+
 def available():
-    """(ok, reason) - fun mode needs pycairo and ffmpeg."""
+    """(ok, reason) - fun mode needs pycairo and ffmpeg (or the finished intro, as the app bundles have)."""
+    if bundled_path():
+        return True, ""
     try:
         import cairo  # noqa: F401
     except ImportError:
@@ -70,7 +81,7 @@ def cached_path():
         p = os.path.join(CACHE_DIR, f"skynet-intro-v{VERSION}{ext}")
         if os.path.exists(p):
             return p
-    return None
+    return bundled_path()
 
 
 def ensure_intro(progress=None):

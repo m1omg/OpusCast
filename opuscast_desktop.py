@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 
@@ -23,7 +24,11 @@ SILENCE = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=4800
 
 
 def session_kind():
-    """'wayland', 'x11', or None when there's no graphical session."""
+    """'windows', 'macos', 'wayland', 'x11', or None when there's no graphical session."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
     if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
         return "wayland"
     return "x11" if os.environ.get("DISPLAY") else None
@@ -51,6 +56,24 @@ def _gst_pipewire():
 # ---------------------------------------------------------------- encoding
 
 _encoder, _encoder_lock = None, threading.Lock()
+_queue_ok, _queue_lock = None, threading.Lock()
+
+
+def input_queue(packets):
+    """["-thread_queue_size", packets] to put before a live input, if this ffmpeg takes it there: up to
+    ffmpeg 9.0 it keeps a short encoder stall from losing sound. Later ffmpeg sizes its input queues
+    itself and refuses the option before an input (it only sets the muxer's queue now): then nothing."""
+    global _queue_ok
+    with _queue_lock:
+        if _queue_ok is None:
+            try:
+                _queue_ok = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-nostdin", "-thread_queue_size", "8", "-f", "lavfi", "-i",
+                     "anullsrc", "-t", "0.1", "-f", "null", "-"],
+                    capture_output=True, timeout=15, **core.NO_WINDOW).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                _queue_ok = False
+    return ["-thread_queue_size", str(packets)] if _queue_ok else []
 
 
 def video_encoder():
@@ -66,7 +89,7 @@ def video_encoder():
 def _find_encoder():
     try:
         listed = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
-                                timeout=15).stdout
+                                timeout=15, **core.NO_WINDOW).stdout
     except (OSError, subprocess.SubprocessError):
         return None, None
     for name in ("libx264", "h264_vaapi", "libopenh264", "mpeg2video"):
@@ -78,7 +101,7 @@ def _find_encoder():
             test = ["ffmpeg", "-v", "error", "-nostdin", *pre, "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30",
                     "-frames:v", "20", "-vf", vf, *args, "-f", "null", "-"]
             try:
-                if subprocess.run(test, capture_output=True, timeout=20).returncode == 0:
+                if subprocess.run(test, capture_output=True, timeout=20, **core.NO_WINDOW).returncode == 0:
                     return name, dev
             except (OSError, subprocess.SubprocessError):
                 pass
@@ -112,8 +135,13 @@ def encoder_label(name):
 
 
 def sound_source():
-    """The PulseAudio/PipeWire source that hears what this PC plays (the default output's monitor),
-    or None when there's no sound server ffmpeg can record from."""
+    """Where to record what this PC plays: Linux - the PulseAudio/PipeWire monitor of the default
+    output; Windows - "wasapi" (loopback of the default output); macOS - a loopback device such as
+    BlackHole, if one is installed (macOS itself can't hand over the Mac's sound). None if nothing."""
+    if sys.platform == "win32":
+        return "wasapi" if _Loopback.available() else None
+    if sys.platform == "darwin":
+        return next((name for _i, name in mac_devices()[1] if LOOPBACK_DEVICE.search(name)), None)
     names = []
     if core.have("pactl"):
         try:
@@ -136,6 +164,114 @@ def sound_source():
         except (OSError, subprocess.SubprocessError):
             pass
     return None
+
+
+LOOPBACK_DEVICE = re.compile(r"blackhole|loopback|soundflower|background music|vb-cable", re.I)
+
+
+def mac_devices():
+    """macOS: ([(index, "Capture screen 0"), ...], [(index, audio input name), ...]) as ffmpeg's
+    AVFoundation input numbers them."""
+    try:
+        err = subprocess.run(["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                             capture_output=True, text=True, timeout=15).stderr
+    except (OSError, subprocess.SubprocessError):
+        return [], []
+    screens, audio, section = [], [], None
+    for line in err.splitlines():
+        if "video devices" in line:
+            section = "video"
+        elif "audio devices" in line:
+            section = "audio"
+        else:
+            m = re.search(r"\]\s*\[(\d+)\]\s*(.+)$", line)
+            if m and section == "video" and m.group(2).startswith("Capture screen"):
+                screens.append((int(m.group(1)), m.group(2).strip()))
+            elif m and section == "audio":
+                audio.append((int(m.group(1)), m.group(2).strip()))
+    return screens, audio
+
+
+def mac_major():
+    """macOS's major version (12 = Monterey, where the settings app still was System Preferences)."""
+    import platform
+    try:
+        return int(platform.mac_ver()[0].split(".")[0])
+    except ValueError:
+        return 0
+
+
+def mac_screen_access():
+    """macOS: may this app record the screen? Asks macOS to show its question if not yet decided
+    (until allowed, only the wallpaper would reach the TV)."""
+    import ctypes
+    try:
+        cg = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        preflight, request = cg.CGPreflightScreenCaptureAccess, cg.CGRequestScreenCaptureAccess
+    except (OSError, AttributeError):
+        return True  # older than macOS 10.15: nothing to allow
+    preflight.restype = request.restype = ctypes.c_bool
+    if preflight():
+        return True
+    request()
+    return False
+
+
+class _Loopback:
+    """Windows: what the PC plays (WASAPI loopback of the default output) as 16-bit PCM for ffmpeg.
+    While nothing plays, Windows sends nothing at all - silence is filled in, so the TV's stream
+    keeps going."""
+
+    @staticmethod
+    def available():
+        try:
+            import pyaudiowpatch as pa
+            p = pa.PyAudio()
+            try:
+                p.get_default_wasapi_loopback()
+                return True
+            finally:
+                p.terminate()
+        except Exception:  # noqa: BLE001 - not installed, no output device, WASAPI unavailable...
+            return False
+
+    def __init__(self):
+        import pyaudiowpatch as pa
+        self.pa = pa.PyAudio()
+        dev = self.pa.get_default_wasapi_loopback()
+        self.rate, self.channels = int(dev["defaultSampleRate"]), max(1, int(dev["maxInputChannels"]))
+        self.stream = self.pa.open(format=pa.paInt16, channels=self.channels, rate=self.rate, input=True,
+                                   input_device_index=dev["index"], frames_per_buffer=1024)
+        self.running = True
+
+    def ffmpeg_input(self):
+        return [*input_queue(1024), "-f", "s16le", "-ar", str(self.rate), "-ac", str(self.channels),
+                "-i", "pipe:0"]
+
+    def run(self, write):
+        frame = 2 * self.channels
+        start, sent = time.monotonic(), 0
+        try:
+            while self.running:
+                ready = self.stream.get_read_available()
+                if ready:
+                    data = self.stream.read(ready, exception_on_overflow=False)
+                    sent += len(data) // frame
+                    write(data)
+                    continue
+                behind = int((time.monotonic() - start) * self.rate) - sent
+                if behind > self.rate // 20:  # 50 ms without sound: nothing plays
+                    write(b"\0" * (behind * frame))
+                    sent += behind
+                time.sleep(0.01)
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        finally:
+            self.stream.close()
+            self.pa.terminate()
+
+    def stop(self):
+        self.running = False
 
 
 def x11_screens():
@@ -351,9 +487,12 @@ class DesktopCast:
     called if capturing stops by itself (the user stopped sharing, ffmpeg died...). Both may be
     called from another thread."""
 
-    def __init__(self, height=1080, fps=30, sound=True, area=None, restore_token=None):
+    def __init__(self, height=1080, fps=30, sound=True, area=None, restore_token=None, screen=None):
         self.width, self.height = SIZES.get(height, SIZES[1080])
-        self.fps, self.want_sound, self.area = fps, sound, area
+        # area: X11/Windows (x, y, width, height) in real pixels, None for everything; screen: macOS's
+        # screen number ("Capture screen N"), None for the main one
+        self.fps, self.want_sound, self.area, self.screen = fps, sound, area, screen
+        self.loopback = None
         self.restore_token = restore_token  # Wayland: the portal's "remember this screen"
         self.live = core.LiveStream()
         self.proc = self.portal = self.frames = None
@@ -378,8 +517,9 @@ class DesktopCast:
         if not core.have("ffmpeg"):
             done(_("desktop casting needs ffmpeg"))
             return
-        if kind == "x11":
-            threading.Thread(target=self._start_x11, args=(done,), daemon=True).start()
+        if kind in ("x11", "windows", "macos"):
+            start = {"x11": self._start_x11, "windows": self._start_windows, "macos": self._start_macos}[kind]
+            threading.Thread(target=start, args=(done,), daemon=True).start()
             return
         if not _gst_pipewire():
             done(_("desktop casting on Wayland needs GStreamer's PipeWire plugin"))
@@ -396,45 +536,104 @@ class DesktopCast:
             threading.Thread(target=self._start_wayland, args=(fd, node, done), daemon=True).start()
         self.portal.start(ready, lambda msg: self._fail(done, msg), self.restore_token)
 
-    def _common(self):
-        """Prepare encoder and sound (slow the first time: tries what works)."""
+    def _common(self, audio_map="1:a:0"):
+        """Prepare encoder and sound (slow the first time: tries what works). Returns (input options
+        for the encoder, the last video filters, output options); the sound source is in self.sound."""
         self.encoder, dev = video_encoder()
         if not self.encoder:
             raise core.TVError(_("ffmpeg here can't encode video"))
         self.sound = sound_source() if self.want_sound else None
-        audio = ["-thread_queue_size", "1024", "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
-                 "-fragment_size", "4096", "-i", self.sound] if self.sound else SILENCE
         pre, vf, venc = encoder_args(self.encoder, dev, self.fps, self.height)
-        out = ["-map", "0:v:0", "-map", "1:a:0", *venc, "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
-               "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
-               "-flush_packets", "1", "pipe:1"]
-        return pre, audio, vf, out
+        out = ["-map", "0:v:0", "-map", audio_map, *venc, "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+               "-ac", "2", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0",
+               "-muxpreload", "0", "-flush_packets", "1", "pipe:1"]
+        return pre, vf, out
+
+    def _fit(self, vf):
+        """Scale whatever shape the screen has into the TV picture, black borders around."""
+        return (f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:flags=bicubic,"
+                f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,{vf}")
 
     def _start_x11(self, done):
         try:
-            pre, audio, vf, out = self._common()
+            pre, vf, out = self._common()
         except core.TVError as e:
             self._fail(done, str(e))
             return
+        audio = [*input_queue(1024), "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
+                 "-fragment_size", "4096", "-i", self.sound] if self.sound else SILENCE
         display = os.environ.get("DISPLAY", ":0")
-        grab = ["-thread_queue_size", "64", "-f", "x11grab", "-draw_mouse", "1", "-framerate", str(self.fps)]
+        grab = [*input_queue(64), "-f", "x11grab", "-draw_mouse", "1", "-framerate", str(self.fps)]
         if self.area:
             x, y, w, h = self.area
             grab += ["-video_size", f"{w - w % 2}x{h - h % 2}", "-i", f"{display}+{x},{y}"]
         else:
             grab += ["-i", display]
-        fit = (f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:flags=bicubic,"
-               f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,{vf}")
-        self._run(done, [*pre, *grab, *audio, "-vf", fit, *out], stdin=subprocess.DEVNULL)
+        self._run(done, [*pre, *grab, *audio, "-vf", self._fit(vf), *out], stdin=subprocess.DEVNULL)
+
+    def _start_windows(self, done):
+        """GDI screen grab (every Windows 10/11), the sound through WASAPI loopback."""
+        try:
+            pre, vf, out = self._common()
+        except core.TVError as e:
+            self._fail(done, str(e))
+            return
+        if self.sound:
+            try:
+                self.loopback = _Loopback()
+            except Exception:  # noqa: BLE001 - PortAudio errors come in many types
+                self.sound = None  # the picture still goes, without sound
+        grab = [*input_queue(64), "-f", "gdigrab", "-framerate", str(self.fps), "-draw_mouse", "1"]
+        if self.area:
+            x, y, w, h = self.area
+            grab += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w - w % 2}x{h - h % 2}"]
+        grab += ["-i", "desktop"]
+        audio = self.loopback.ffmpeg_input() if self.loopback else SILENCE
+        stdin = subprocess.PIPE if self.loopback else subprocess.DEVNULL
+        if not self._run(done, [*pre, *grab, *audio, "-vf", self._fit(vf), *out], stdin=stdin, wait=False):
+            return
+        if self.loopback:
+            threading.Thread(target=self.loopback.run, args=(self.proc.stdin.write,), daemon=True).start()
+        self._wait_first_picture(done)
+
+    def _start_macos(self, done):
+        """AVFoundation screen capture (allowed under Privacy → Screen Recording); the sound from a
+        loopback device such as BlackHole when there is one."""
+        if not mac_screen_access():
+            self._fail(done, _("macOS hasn't allowed OpusCast to record the screen yet. Allow it in System "
+                               "Settings → Privacy & Security → Screen Recording, then start OpusCast again.")
+                       if mac_major() >= 13 else
+                       _("macOS hasn't allowed OpusCast to record the screen yet. Allow it in System Preferences → "
+                         "Security & Privacy → Privacy → Screen Recording, then start OpusCast again."))
+            return
+        screens, audio_devices = mac_devices()
+        if not screens:
+            self._fail(done, _("ffmpeg here can't see the screen (no AVFoundation screen capture)"))
+            return
+        video = next((i for i, name in screens if name.endswith(f" {self.screen or 0}")), screens[0][0])
+        sound = next((i for i, name in audio_devices if self.want_sound and LOOPBACK_DEVICE.search(name)), None)
+        try:
+            pre, vf, out = self._common(audio_map="0:a:0" if sound is not None else "1:a:0")
+        except core.TVError as e:
+            self._fail(done, str(e))
+            return
+        grab = [*input_queue(64), "-f", "avfoundation", "-capture_cursor", "1", "-framerate",
+                str(self.fps), "-i", f"{video}:{sound if sound is not None else 'none'}"]
+        if sound is None:
+            self.sound = None
+            grab += SILENCE
+        self._run(done, [*pre, *grab, "-vf", self._fit(vf), *out], stdin=subprocess.DEVNULL)
 
     def _start_wayland(self, fd, node, done):
         try:
-            pre, audio, vf, out = self._common()
+            pre, vf, out = self._common()
             self.frames = _PipeWireFrames(fd, node, self.width, self.height, self.fps)
         except Exception as e:  # noqa: BLE001 - GStreamer errors come in many types
             self._fail(done, str(e))
             return
-        raw = ["-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+        audio = [*input_queue(1024), "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
+                 "-fragment_size", "4096", "-i", self.sound] if self.sound else SILENCE
+        raw = [*input_queue(64), "-f", "rawvideo", "-pix_fmt", "yuv420p",
                "-video_size", f"{self.width}x{self.height}", "-framerate", str(self.fps),
                "-use_wallclock_as_timestamps", "1", "-i", "pipe:0"]
         if not self._run(done, [*pre, *raw, *audio, "-vf", vf, "-r", str(self.fps), *out], stdin=subprocess.PIPE,
@@ -447,7 +646,7 @@ class DesktopCast:
     def _run(self, done, args, stdin, wait=True):
         try:
             self.proc = subprocess.Popen(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", *args],
-                                         stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                         stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **core.NO_WINDOW)
         except OSError as e:
             self._fail(done, str(e))
             return False
@@ -484,7 +683,12 @@ class DesktopCast:
                 self._log = (self._log + [text])[-12:]
 
     def _why(self):
-        return self._log[-1] if self._log else None
+        """ffmpeg's own reason: its last lines are often just "Error opening input files", the line
+        before says what really failed."""
+        generic = re.compile(r"^(Error (opening|parsing options for) (input|output)|Conversion failed|Error while|"
+                             r"\[(in|out)#\d)", re.I)
+        specific = [line for line in self._log if not generic.match(line)]
+        return (specific or self._log or [None])[-1]
 
     def _fail(self, done, message):
         self.stop()
@@ -503,6 +707,8 @@ class DesktopCast:
         self.stopped = True
         if self.frames:
             self.frames.stop()
+        if self.loopback:
+            self.loopback.stop()
         proc, self.proc = self.proc, None
         if proc and proc.poll() is None:
             try:

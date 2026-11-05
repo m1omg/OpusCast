@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag to create, e.g. v1.1"
+        description: "Version tag to create, e.g. v1.0"
         required: true
 
 jobs:
@@ -15,9 +15,15 @@ jobs:
     uses: ./.github/workflows/android.yml
     secrets: inherit
 
+  desktop:
+    uses: ./.github/workflows/desktop.yml
+    with:
+      release: true
+
   publish:
-    needs: [android]
+    needs: [android, desktop]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     concurrency: release-${{ inputs.tag }}
@@ -38,11 +44,21 @@ jobs:
           name: OpusCast-android
           path: apk
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: OpusCast-{windows,macos}
+          path: desktop
+          merge-multiple: true
+
       - name: Publish the release
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cp apk/*.apk "OpusCast-$TAG.apk"
-          gh release create "$TAG" "OpusCast-$TAG.apk" --target "$GITHUB_SHA" --title "OpusCast ${TAG#v}" \
+          cp desktop/OpusCast-Setup.exe "OpusCast-$TAG-Windows-Setup.exe"
+          cp desktop/OpusCast-windows-x64.zip "OpusCast-$TAG-Windows.zip"
+          cp desktop/OpusCast-macOS.dmg "OpusCast-$TAG-macOS.dmg"
+          gh release create "$TAG" "OpusCast-$TAG.apk" "OpusCast-$TAG-Windows-Setup.exe" "OpusCast-$TAG-Windows.zip" \
+            "OpusCast-$TAG-macOS.dmg" --target "$GITHUB_SHA" --title "OpusCast ${TAG#v}" \
             --notes-file ".github/releases/$TAG.md"

@@ -1,0 +1,228 @@
+name: Windows and macOS
+
+# Builds OpusCast for Windows (installer + zip) and macOS (one app for Intel and Apple silicon Macs,
+# macOS 12 Monterey and newer), with ffmpeg and the Skynet intro inside. Every build is tried first: the
+# command line against a fake TV, then the finished app. The Release workflow publishes them.
+on:
+  push:
+    branches: ["**"]
+    paths: ["opuscast*.py", "opuscast", "data/**", "packaging/**", "tests/**", ".github/workflows/desktop.yml"]
+  pull_request:
+    paths: ["opuscast*.py", "opuscast", "data/**", "packaging/**", "tests/**", ".github/workflows/desktop.yml"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: "Called by the Release workflow: build the apps, skip the Linux-only test"
+        type: boolean
+        default: false
+
+env:
+  PYSIDE: "6.8.3"  # Qt 6.8: the last to run on macOS 12
+  PYINSTALLER: "6.22.3"
+
+jobs:
+  intro:
+    name: Skynet intro (rendered once)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: pycairo
+        run: |
+          # The runner's package mirror sometimes stalls for a long time: each try is cut off after 15 minutes.
+          for try in 1 2; do
+            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q python3-cairo && exit 0
+            echo "::warning::apt-get didn't finish, trying again"; sudo dpkg --configure -a || true
+          done
+          exit 1
+      - name: ffmpeg (BtbN's static build of the newest FFmpeg release, from GitHub - quicker than Ubuntu's mirror)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api repos/BtbN/FFmpeg-Builds/releases/tags/latest --jq '
+            [.assets[].browser_download_url | select(test("/ffmpeg-n[0-9.]+-latest-linux64-gpl-[0-9.]+\\.tar\\.xz$"))]
+            | sort_by(capture("-n(?<v>[0-9.]+)-latest").v | split(".") | map(tonumber)) | last // empty')
+          test -n "$url" || { echo "::error::no FFmpeg release build found at BtbN"; exit 1; }
+          echo "$url"
+          curl -fsSL -o "$RUNNER_TEMP/ff.tar.xz" "$url"
+          mkdir -p "$RUNNER_TEMP/ff" && tar -xJf "$RUNNER_TEMP/ff.tar.xz" -C "$RUNNER_TEMP/ff" --strip-components=1
+          echo "$RUNNER_TEMP/ff/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ff/bin/ffmpeg" -hide_banner -version | head -1
+      - name: Render
+        run: |
+          mkdir -p build-extra
+          XDG_CACHE_HOME="$RUNNER_TEMP/cache" python3 -c "import opuscast_intro as i, shutil; shutil.copy(i.ensure_intro(), 'build-extra/')"
+          ls -la build-extra
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intro
+          path: build-extra/skynet-intro-v*.mp4
+          if-no-files-found: error
+
+  linux:
+    name: Linux command line against a fake TV
+    # Not in a release: Linux isn't packaged, and this already ran on the commit being released.
+    if: ${{ !inputs.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: ffmpeg and a virtual screen
+        run: |
+          # The runner's package mirror sometimes stalls for a long time: each try is cut off after 15 minutes.
+          for try in 1 2; do
+            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q ffmpeg xvfb && exit 0
+            echo "::warning::apt-get didn't finish, trying again"; sudo dpkg --configure -a || true
+          done
+          exit 1
+      - run: xvfb-run -a python3 tests/smoke.py --desktop
+
+  windows:
+    needs: intro
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q "PySide6-Essentials==$PYSIDE" "PySide6-Addons==$PYSIDE" "pyinstaller==$PYINSTALLER" PyAudioWPatch
+      - uses: actions/download-artifact@v4
+        with:
+          name: intro
+          path: build-extra
+      - name: ffmpeg (BtbN's GPL build of the newest FFmpeg release, shared DLLs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The newest release branch BtbN builds (n9.0, later n9.1...), not the master snapshot.
+          url=$(gh api repos/BtbN/FFmpeg-Builds/releases/tags/latest --jq '
+            [.assets[].browser_download_url | select(test("/ffmpeg-n[0-9.]+-latest-win64-gpl-shared-[0-9.]+\\.zip$"))]
+            | sort_by(capture("-n(?<v>[0-9.]+)-latest").v | split(".") | map(tonumber)) | last // empty')
+          test -n "$url" || { echo "::error::no FFmpeg release build found at BtbN"; exit 1; }
+          echo "$url"
+          curl -fsSL -o ff.zip "$url"
+          unzip -q ff.zip -d ff
+          mkdir -p build-extra/ffmpeg
+          cp ff/*/bin/* build-extra/ffmpeg/
+          rm -f build-extra/ffmpeg/ffplay.exe
+          cp ff/*/LICENSE.txt build-extra/ffmpeg/FFMPEG-LICENSE.txt
+          build-extra/ffmpeg/ffmpeg.exe -hide_banner -version | head -1
+      - name: Try the command line against a fake TV (songs, photos)
+        run: PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py
+      - name: Try casting the desktop against the fake TV
+        run: |
+          echo "--- can ffmpeg grab this runner's screen at all?"
+          build-extra/ffmpeg/ffmpeg.exe -hide_banner -f gdigrab -framerate 30 -i desktop -t 2 -f null - 2>&1 | tail -8 || true
+          PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py --desktop
+      - name: Build the app
+        run: pyinstaller --noconfirm --log-level WARN packaging/opuscast.spec
+      - name: Try the app
+        timeout-minutes: 5
+        env:
+          QT_QPA_PLATFORM: offscreen
+          OPUSCAST_SELFTEST_OUT: ${{ runner.temp }}/selftest.json
+        run: |
+          dist/OpusCast/OpusCast.exe --selftest &
+          for i in $(seq 1 60); do [ -s "$OPUSCAST_SELFTEST_OUT" ] && break; sleep 1; done
+          cat "$OPUSCAST_SELFTEST_OUT"
+          python -c "import json,sys; r=json.load(open(sys.argv[1])); assert r['ffmpeg'] and r['ffprobe'] and r['preview'] and r['intro'] and r['encoder'], r" "$OPUSCAST_SELFTEST_OUT"
+      - name: Installer
+        timeout-minutes: 20
+        run: |
+          choco install innosetup -y --no-progress > /dev/null
+          version=$(python -c "import opuscast_core as c; print(c.APP_VERSION)")
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DAppVersion=$version" packaging/opuscast.iss
+          (cd dist && 7z a -bd -tzip OpusCast-windows-x64.zip OpusCast > /dev/null)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpusCast-windows
+          path: |
+            dist/OpusCast-Setup.exe
+            dist/OpusCast-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    needs: intro
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      PY: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python for Intel and Apple silicon (python.org universal2)
+        run: |
+          curl -fsSLO https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg python-3.12.10-macos11.pkg -target / > /dev/null
+          "$PY" -m pip install -q "PySide6-Essentials==$PYSIDE" "PySide6-Addons==$PYSIDE" "pyinstaller==$PYINSTALLER"
+      - uses: actions/download-artifact@v4
+        with:
+          name: intro
+          path: build-extra
+      - name: ffmpeg for both kinds of Mac (static builds by Martin Riedl, joined with lipo)
+        run: |
+          mkdir -p ff/arm64 ff/amd64 build-extra/ffmpeg
+          for arch in arm64 amd64; do
+            for prog in ffmpeg ffprobe; do
+              curl -fsSL -o "ff/$arch/$prog.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$arch/release/$prog.zip"
+              unzip -q -o "ff/$arch/$prog.zip" -d "ff/$arch"
+            done
+          done
+          for prog in ffmpeg ffprobe; do
+            lipo -create -output "build-extra/ffmpeg/$prog" "ff/arm64/$prog" "ff/amd64/$prog"
+            chmod +x "build-extra/ffmpeg/$prog"
+          done
+          build-extra/ffmpeg/ffmpeg -hide_banner -version | head -1
+      - name: Try the command line against a fake TV (songs, photos, desktop)
+        run: PATH="$PWD/build-extra/ffmpeg:$PATH" "$PY" tests/smoke.py --desktop
+      - name: Build the app
+        run: |
+          "$PY" -m PyInstaller --noconfirm --log-level WARN packaging/opuscast.spec
+          "$PY" packaging/check_macos.py dist/OpusCast.app
+      - name: Try the app
+        env:
+          QT_QPA_PLATFORM: offscreen
+          OPUSCAST_SELFTEST_OUT: ${{ runner.temp }}/selftest.json
+        run: |
+          dist/OpusCast.app/Contents/MacOS/OpusCast --selftest
+          cat "$OPUSCAST_SELFTEST_OUT"
+          "$PY" -c "import json,sys; r=json.load(open(sys.argv[1])); assert r['ffmpeg'] and r['ffprobe'] and r['preview'] and r['intro'] and r['encoder'], r" "$OPUSCAST_SELFTEST_OUT"
+      - name: Disk image
+        run: |
+          mkdir -p dmg && cp -R dist/OpusCast.app dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname OpusCast -srcfolder dmg -ov -format UDZO dist/OpusCast-macOS.dmg > /dev/null
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpusCast-macos
+          path: dist/OpusCast-macOS.dmg
+          if-no-files-found: error
+
+  macos-intel:
+    name: macOS on an Intel Mac
+    needs: macos
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: OpusCast-macos
+      - name: The app and its ffmpeg run on Intel
+        env:
+          QT_QPA_PLATFORM: offscreen
+          OPUSCAST_SELFTEST_OUT: ${{ runner.temp }}/selftest.json
+        run: |
+          uname -m
+          hdiutil attach -nobrowse -mountpoint /Volumes/OpusCast OpusCast-macOS.dmg > /dev/null
+          app=/Volumes/OpusCast/OpusCast.app
+          "$app/Contents/Frameworks/ffmpeg/ffmpeg" -hide_banner -version | head -1
+          "$app/Contents/MacOS/OpusCast" --selftest
+          cat "$OPUSCAST_SELFTEST_OUT"
+          python3 -c "import json,sys; r=json.load(open(sys.argv[1])); assert r['ffmpeg'] and r['preview'] and r['encoder'], r" "$OPUSCAST_SELFTEST_OUT"

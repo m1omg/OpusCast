@@ -319,6 +319,36 @@ SK = {
     "60 pictures a second - needs a fast PC": "60 snímok za sekundu – potrebuje rýchly počítač",
     "Use this speaker": "Použiť tento reproduktor",
     "Screen {n}": "Obrazovka {n}",
+    # Windows and macOS
+    "macOS hasn't allowed OpusCast to record the screen yet. Allow it in System Settings → Privacy & Security → "
+    "Screen Recording, then start OpusCast again.":
+        "macOS zatiaľ nepovolil OpusCastu nahrávať obrazovku. Povoľte ho v Systémových nastaveniach → Súkromie "
+        "a bezpečnosť → Nahrávanie obrazovky a spustite OpusCast znova.",
+    "macOS hasn't allowed OpusCast to record the screen yet. Allow it in System Preferences → Security & Privacy → "
+    "Privacy → Screen Recording, then start OpusCast again.":
+        "macOS zatiaľ nepovolil OpusCastu nahrávať obrazovku. Povoľte ho v Systémových nastaveniach → Bezpečnosť "
+        "a súkromie → Súkromie → Nahrávanie obrazovky a spustite OpusCast znova.",
+    "ffmpeg here can't see the screen (no AVFoundation screen capture)":
+        "ffmpeg v tomto počítači nevidí obrazovku (chýba snímanie obrazovky AVFoundation)",
+    "Qt Multimedia isn't installed": "Qt Multimedia nie je nainštalované",
+    "TV volume (↑/↓)": "Hlasitosť televízora (↑/↓)",
+    "macOS doesn't hand the Mac's sound to apps by itself. With BlackHole (free) installed and set as the output, "
+    "the sound goes to the TV too.":
+        "macOS sám od seba nedáva aplikáciám zvuk Macu. S nainštalovaným BlackHole (zadarmo) nastaveným ako "
+        "výstup ide do televízora aj zvuk.",
+    "The TV hasn't started loading it. macOS's firewall may be blocking it: in System Settings → Network → "
+    "Firewall → Options, let OpusCast accept incoming connections.":
+        "Televízor to nezačal načítavať. Možno ho blokuje firewall macOS: v Systémových nastaveniach → Sieť → "
+        "Firewall → Možnosti povoľte OpusCastu prichádzajúce spojenia.",
+    "The TV hasn't started loading it. macOS's firewall may be blocking it: in System Preferences → Security & "
+    "Privacy → Firewall → Firewall Options, let OpusCast accept incoming connections.":
+        "Televízor to nezačal načítavať. Možno ho blokuje firewall macOS: v Systémových nastaveniach → Bezpečnosť "
+        "a súkromie → Firewall → Možnosti firewallu povoľte OpusCastu prichádzajúce spojenia.",
+    "The Mac's sound isn't going to the TV: macOS doesn't hand it to apps by itself. Install BlackHole (free) and "
+    "set it as the output to send it along.":
+        "Zvuk Macu nejde do televízora: macOS ho aplikáciám sám nedáva. Nainštalujte BlackHole (zadarmo) "
+        "a nastavte ho ako výstup, potom pôjde aj zvuk.",
+    "“Show on PC” isn't available here ({reason}).": "„Zobraziť na PC“ tu nie je k dispozícii ({reason}).",
     "The TV may not show {name}: this PC can't convert this kind of photo. This helps:":
         "Televízor možno {name} neukáže: tento počítač tento druh fotiek nevie previesť. Pomôže toto:",
     "(keep this open - Ctrl+C stops)": "(nechajte toto otvorené – Ctrl+C zastaví)",
