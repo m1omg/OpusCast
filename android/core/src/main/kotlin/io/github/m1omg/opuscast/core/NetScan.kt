@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/** A device seen on the network, and whether it can play video. */
+/** A device seen on the network, and what it can play. */
 data class NetDevice(
     val ip: String,
     val name: String?,
@@ -16,9 +16,26 @@ data class NetDevice(
     val note: Note,
     val tv: Tv?,
 ) {
-    val canPlay get() = kind == Kind.TV
+    /** It can be picked: a TV, or a speaker (music only). */
+    val canPlay get() = tv != null && (kind == Kind.TV || kind == Kind.SPEAKER)
+    val musicOnly get() = kind == Kind.SPEAKER
     enum class Kind { TV, SPEAKER, ROUTER, UPNP, UNKNOWN, THIS_DEVICE }
-    enum class Note { CAN_PLAY_VIDEO, AUDIO_ONLY, ROUTER, MEDIA_SERVER, NETWORK_DEVICE, NO_CASTING, THIS_DEVICE }
+    enum class Note {
+        CAN_PLAY_VIDEO, AUDIO_ONLY, ROUTER, MEDIA_SERVER, NETWORK_DEVICE, NO_CASTING, THIS_DEVICE,
+        /** A Philips TV whose DLNA renderer ("Digital Media Renderer - DMR") is switched off. */
+        DMR_OFF,
+        /** Chromecast, a Google TV streamer, an Nvidia Shield: Google Cast only, no DLNA. */
+        CAST_ONLY,
+    }
+}
+
+/** Why a UPnP device that can't play anything still matters: a TV with DLNA off, or a Google Cast device. */
+internal fun hintFor(devices: List<DeviceInfo>): NetDevice.Note? {
+    val text = devices.joinToString(" ") { "${it.manufacturer} ${it.model} ${it.name}" }.lowercase()
+    if ("philips" in text || "tp vision" in text) return NetDevice.Note.DMR_OFF
+    val dial = devices.any { d -> d.types.any { "dial-multiscreen" in it.lowercase() } }
+    val cast = listOf("google", "chromecast", "nvidia", "shield").any { it in text }
+    return if (dial && cast) NetDevice.Note.CAST_ONLY else null
 }
 
 /** Addresses on [myIp]'s /24 (or smaller) network that answer, found by trying to connect to each. */
@@ -78,8 +95,9 @@ fun scanNetwork(myIp: String?, gateway: String?, otherHosts: Set<String> = empty
     val hostnames = reverseDns(hosts.filter { it != myIp }, 1500)
     val renderers = descs.filter { "AVTransport" in it.services }.distinctBy { it.host }
     val videoCheck = Executors.newFixedThreadPool(4)
+    val tvs = renderers.associate { it.host to Tv(it) } // one each, so the format list asked here stays with it
     val plays = try {
-        renderers.associate { d -> d.host to videoCheck.submit<Boolean?> { Tv(d).playsVideo() } }.mapValues { it.value.get() }
+        tvs.mapValues { (_, tv) -> videoCheck.submit<Boolean?> { tv.playsVideo() } }.mapValues { it.value.get() }
     } finally {
         videoCheck.shutdown()
     }
@@ -91,7 +109,7 @@ fun scanNetwork(myIp: String?, gateway: String?, otherHosts: Set<String> = empty
         out += when {
             h == myIp -> NetDevice(h, null, thisDeviceName, NetDevice.Kind.THIS_DEVICE, NetDevice.Note.THIS_DEVICE, null)
             renderer != null -> {
-                val tv = Tv(renderer)
+                val tv = tvs[h] ?: Tv(renderer)
                 val detail = listOf(tv.manufacturer, tv.model).filter { it.isNotEmpty() }.joinToString(" ")
                 if (plays[h] == false) NetDevice(h, tv.name, detail, NetDevice.Kind.SPEAKER, NetDevice.Note.AUDIO_ONLY, tv)
                 else NetDevice(h, tv.name, detail, NetDevice.Kind.TV, NetDevice.Note.CAN_PLAY_VIDEO, tv)
@@ -103,8 +121,9 @@ fun scanNetwork(myIp: String?, gateway: String?, otherHosts: Set<String> = empty
             mine.isNotEmpty() -> {
                 val d = mine.firstOrNull { it.name.isNotEmpty() } ?: mine[0]
                 val server = d.types.any { "MediaServer" in it }
+                val hint = hintFor(mine)
                 NetDevice(h, d.name.ifEmpty { dns }, listOf(d.manufacturer, d.model).filter { it.isNotEmpty() }.joinToString(" "),
-                    NetDevice.Kind.UPNP, if (server) NetDevice.Note.MEDIA_SERVER else NetDevice.Note.NETWORK_DEVICE, null)
+                    NetDevice.Kind.UPNP, hint ?: if (server) NetDevice.Note.MEDIA_SERVER else NetDevice.Note.NETWORK_DEVICE, null)
             }
             else -> NetDevice(h, dns, "", NetDevice.Kind.UNKNOWN, NetDevice.Note.NO_CASTING, null)
         }

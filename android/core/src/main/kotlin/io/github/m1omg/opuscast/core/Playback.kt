@@ -73,27 +73,82 @@ internal fun reshowWhenPlaying(tv: Tv, server: MediaServer, media: Media, seq: I
     }
 }
 
-/** Hand published media to the TV and start it, optionally resuming at [startAt] seconds and switching
- *  its subtitle on. Returns the showSubtitle() result, or null without subtitles. Blocks for a while. */
-fun playMedia(tv: Tv, server: MediaServer, media: Media, startAt: Double = 0.0, waitSeconds: Double = 20.0,
-              subsOn: Boolean = false): String? {
-    val url = server.url(media, tv.host)
-    val sub = server.subUrl(media, tv.host)
-    try {
-        tv.stop()
-    } catch (e: TvException) {
-        // nothing was playing
+/** What [tv] is told about [media]: the DIDL-Lite item with this server's URLs. */
+fun itemInfo(tv: Tv, server: MediaServer, media: Media): ItemInfo = ItemInfo(
+    title = media.title,
+    mime = media.mime,
+    features = media.features,
+    size = if (media.live != null) null else media.source.size,
+    kind = media.kind,
+    subUrl = if (media.kind == MediaKind.VIDEO) server.subUrl(media, tv.host) else null,
+    durationMs = media.knownDurationMs,
+    artist = media.artist,
+    album = media.album,
+    coverUrl = media.coverPath?.let { server.urlFor(tv.host, it) },
+    coverJpeg = media.coverPath?.let { media.extras[it]?.first } == "image/jpeg",
+)
+
+/** Play, right after SetAVTransportURI. Some TVs are still busy taking the new item and answer 701
+ *  ("transition not available"): ask again a few times. Some start by themselves meanwhile, which counts. */
+internal fun playAfterSet(tv: Tv, pauseMs: Long = 700, retries: Int = 4) {
+    var left = retries
+    while (true) {
+        try {
+            tv.play()
+            return
+        } catch (e: TvException) {
+            if (e.upnpCode != 701 || left <= 0) throw e
+            val state = try {
+                tv.state()
+            } catch (x: TvException) {
+                null
+            }
+            if (state == "PLAYING" || state == "TRANSITIONING") return
+            left -= 1
+            sleepMs(pauseMs)
+        }
     }
-    tv.setMedia(url, media.title, media.source.mime, media.source.size, sub)
-    tv.play()
+}
+
+/** Hand published media to the TV and start it, optionally resuming at [startAt] seconds and switching
+ *  its subtitle on. Returns the showSubtitle() result, or null without subtitles. Blocks for a while.
+ *  [stopFirst] = false goes from one photo to the next without the TV's stop screen in between (a TV
+ *  that won't take a new item while it shows one is stopped after all). */
+fun playMedia(tv: Tv, server: MediaServer, media: Media, startAt: Double = 0.0, waitSeconds: Double = 20.0,
+              subsOn: Boolean = false, stopFirst: Boolean = true): String? {
+    val url = server.url(media, tv.host)
+    val sub = if (media.kind == MediaKind.VIDEO) server.subUrl(media, tv.host) else null
+    val item = itemInfo(tv, server, media)
+    if (stopFirst) {
+        try {
+            tv.stop()
+        } catch (e: TvException) {
+            // nothing was playing
+        }
+        tv.setMedia(url, item)
+    } else {
+        try {
+            tv.setMedia(url, item)
+        } catch (e: TvException) {
+            if (e.reason != TvException.Reason.REFUSED) throw e
+            try {
+                tv.stop()
+            } catch (x: TvException) {
+                // it wasn't playing either
+            }
+            tv.setMedia(url, item)
+        }
+    }
+    playAfterSet(tv)
+    val seekable = media.kind == MediaKind.VIDEO || media.kind == MediaKind.AUDIO
     var playing = false
-    if (startAt > 1 || (sub != null && subsOn)) {
+    if ((startAt > 1 && seekable) || (sub != null && subsOn)) {
         val deadline = now() + secs(waitSeconds)
         while (now() < deadline) {
             try {
                 if (tv.state() == "PLAYING") {
                     playing = true
-                    if (startAt > 1) tv.seek(startAt)
+                    if (startAt > 1 && seekable) tv.seek(startAt)
                     break
                 }
             } catch (e: TvException) {

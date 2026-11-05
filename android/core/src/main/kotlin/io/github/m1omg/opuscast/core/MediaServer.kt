@@ -1,6 +1,7 @@
 package io.github.m1omg.opuscast.core
 
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
@@ -44,7 +45,7 @@ fun stemOf(name: String): String {
     return if (dot > 0) name.substring(0, dot) else name
 }
 
-/** What the TV is fed: a file on disk, or (on Android) a document from the system file picker. */
+/** What the TV is fed: a file on disk, a document from the system file picker (Android), or bytes made here. */
 interface MediaSource {
     /** The file name, e.g. "Movie.mkv". */
     val name: String
@@ -54,7 +55,8 @@ interface MediaSource {
     /** The bytes from [offset] on. */
     fun openAt(offset: Long): InputStream
     val title: String get() = stemOf(name)
-    val mime: String get() = MIME[extensionOf(name)] ?: "video/mp4"
+    val mime: String get() = mimeFor(name)
+    val kind: MediaKind get() = kindOf(name, mime) ?: MediaKind.VIDEO
 }
 
 class FileSource(private val file: File, override val durationMs: Long? = null) : MediaSource {
@@ -67,9 +69,43 @@ class FileSource(private val file: File, override val durationMs: Long? = null) 
     }
 }
 
-/** One published video and its subtitle files. */
-class Media internal constructor(val source: MediaSource, val token: String) {
-    private val ext = extensionOf(source.name).takeIf { it in MIME } ?: ".mp4"
+/** Bytes made here, e.g. a photo converted to a JPEG the TV can show. */
+class BytesSource(
+    override val name: String,
+    val bytes: ByteArray,
+    override val mime: String = mimeFor(name),
+    override val kind: MediaKind = kindOf(name, mime) ?: MediaKind.IMAGE,
+    title: String? = null,
+) : MediaSource {
+    override val size = bytes.size.toLong()
+    override val durationMs: Long? = null
+    override val title: String = title ?: stemOf(name)
+    override fun openAt(offset: Long): InputStream = ByteArrayInputStream(bytes, offset.toInt(), (size - offset).toInt())
+}
+
+/** Stands in for the file of a live stream: there is none, the bytes come from a [LiveHub]. */
+private class LiveSource(override val title: String) : MediaSource {
+    override val name = "live.ts"
+    override val size = -1L
+    override val durationMs: Long? = null
+    override val mime = "video/mpeg"
+    override val kind = MediaKind.LIVE
+    override fun openAt(offset: Long): InputStream = throw IOException("a live stream has no file")
+}
+
+/** One published video, song, photo or live stream, and the files that go with it (subtitles, album cover). */
+class Media internal constructor(
+    val source: MediaSource,
+    val token: String,
+    /** The MIME type as the TV is told it (its own spelling where it lists one). */
+    val mime: String,
+    /** The DLNA features announced with it (protocolInfo, contentFeatures.dlna.org). */
+    val features: String,
+    /** Where a live stream's bytes come from; null for files. */
+    val live: LiveHub? = null,
+) {
+    val kind: MediaKind get() = if (live != null) MediaKind.LIVE else source.kind
+    private val ext = urlExtension(source.name, mime)
     val urlPath = "/media/$token$ext"
     val blankPath = "/media/$token-off.srt"
     /** The subtitle announced with the video, if any. */
@@ -89,6 +125,15 @@ class Media internal constructor(val source: MediaSource, val token: String) {
         internal set
     /** What play() returned for the start-up subtitle: "ok", "unsupported" or null. */
     @Volatile var captions: String? = null
+    /** URL path -> (MIME type, bytes) of other files that go with it, e.g. the album cover. */
+    val extras: MutableMap<String, Pair<String, ByteArray>> = ConcurrentHashMap()
+    /** Music: shown by the TV next to the title. */
+    @Volatile var artist: String? = null
+    @Volatile var album: String? = null
+    /** URL path of the album cover (one of [extras]). */
+    @Volatile var coverPath: String? = null
+    /** Length announced to the TV up front, when known (music). */
+    @Volatile var knownDurationMs: Long? = null
     val title get() = source.title
     @Volatile private var duration: Long? = null
     @Volatile private var durationKnown = false
@@ -140,14 +185,23 @@ class MediaServer(port: Int = DEFAULT_PORT) {
 
     private fun token(bytes: Int) = ByteArray(bytes).also { random.nextBytes(it) }.joinToString("") { "%02x".format(it) }
 
-    /** Serve a video, optionally with a subtitle (SRT bytes) announced to the TV with it. */
-    fun publish(source: MediaSource, subtitle: ByteArray? = null): Media {
-        val media = Media(source, token(8))
+    /** Serve a video, song or photo, optionally with a subtitle (SRT bytes) announced to the TV with it.
+     *  [mime] is what the TV is told (see [SinkFormats.spell]); [features] the DLNA features to go with it. */
+    fun publish(source: MediaSource, subtitle: ByteArray? = null, mime: String = source.mime,
+                features: String = Dlna.forKind(source.kind, mime)): Media {
+        val media = Media(source, token(8), mime, features)
         media.subs[media.blankPath] = BLANK_SRT
         if (subtitle != null) {
             media.subPath = "/media/${media.token}.srt"
             media.subs[media.subPath!!] = subtitle
         }
+        current = media
+        return media
+    }
+
+    /** Serve a live MPEG-TS stream: every request for it gets the stream from [hub], from a keyframe on. */
+    fun publishLive(hub: LiveHub, title: String, mime: String = "video/mpeg"): Media {
+        val media = Media(LiveSource(title), token(8), mime, Dlna.LIVE, hub)
         current = media
         return media
     }
@@ -162,6 +216,13 @@ class MediaServer(port: Int = DEFAULT_PORT) {
         return path
     }
 
+    /** Serve a file that goes with [media] (e.g. its album cover, [ext] like ".jpg"); returns its URL path. */
+    fun addExtra(media: Media, ext: String, mime: String, data: ByteArray): String {
+        val path = "/media/${media.token}-${token(3)}$ext"
+        media.extras[path] = mime to data
+        return path
+    }
+
     /** This machine's address as the TV at the given host should use it (network I/O: not on a UI thread). */
     @Volatile var addressFor: (String) -> String = ::localIpTowards
 
@@ -170,9 +231,13 @@ class MediaServer(port: Int = DEFAULT_PORT) {
     fun subUrl(media: Media, tvHost: String) = media.subPath?.let { urlFor(tvHost, it) }
     fun eventUrl(tvHost: String, service: String) = "http://${addressFor(tvHost)}:$port/events/$service"
 
+    /** Open connections, closed with the server (a TV's kept-alive one would otherwise still be answered). */
+    private val connections = ConcurrentHashMap.newKeySet<Socket>()
+
     fun close() {
         closed = true
         runCatching { socket.close() }
+        connections.forEach { runCatching { it.close() } }
         pool.shutdownNow()
     }
 
@@ -184,8 +249,10 @@ class MediaServer(port: Int = DEFAULT_PORT) {
                 if (closed) return else continue
             }
             try {
+                connections += c
                 pool.execute { serve(c) }
             } catch (e: Exception) {
+                connections -= c
                 runCatching { c.close() }
             }
         }
@@ -194,12 +261,14 @@ class MediaServer(port: Int = DEFAULT_PORT) {
     private fun serve(c: Socket) {
         try {
             c.use {
+                if (closed) return
                 c.soTimeout = 120_000
                 c.tcpNoDelay = true
                 val input = BufferedInputStream(c.getInputStream(), 16384)
                 val output = c.getOutputStream()
                 while (!closed) {
                     val head = readHead(input) ?: return
+                    if (closed) return
                     val lines = head.split("\r\n")
                     val parts = lines[0].split(" ")
                     if (parts.size < 2) return
@@ -208,23 +277,26 @@ class MediaServer(port: Int = DEFAULT_PORT) {
                         val i = line.indexOf(':')
                         if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
                     }
+                    val version = parts.getOrNull(2) ?: "HTTP/1.0"
                     val keepAlive = when {
                         headers["connection"]?.lowercase() == "close" -> false
-                        parts.getOrNull(2) == "HTTP/1.0" -> headers["connection"]?.lowercase() == "keep-alive"
+                        version == "HTTP/1.0" -> headers["connection"]?.lowercase() == "keep-alive"
                         else -> true
                     }
-                    if (!handle(parts[0].uppercase(), parts[1], headers, input, output, c)) return
+                    if (!handle(parts[0].uppercase(), parts[1], version, headers, input, output, c)) return
                     output.flush()
                     if (!keepAlive) return
                 }
             }
         } catch (e: IOException) {
             // the TV drops connections all the time (seeking, buffering)
+        } finally {
+            connections -= c
         }
     }
 
     /** Returns false when the connection can't be reused. */
-    private fun handle(method: String, target: String, headers: Map<String, String>, input: InputStream,
+    private fun handle(method: String, target: String, version: String, headers: Map<String, String>, input: InputStream,
                        out: OutputStream, c: Socket): Boolean {
         val path = runCatching { URI(target).rawPath }.getOrNull() ?: target.substringBefore('?')
         if (method == "NOTIFY") {
@@ -260,6 +332,15 @@ class MediaServer(port: Int = DEFAULT_PORT) {
             if (body) out.write(sub)
             return true
         }
+        val extra = media?.extras?.get(path)
+        if (extra != null) {
+            val (mime, data) = extra
+            respond(out, 200, "OK", listOf("Content-Type" to mime, "Content-Length" to data.size.toString(),
+                "transferMode.dlna.org" to (headers["transfermode.dlna.org"] ?: "Interactive"),
+                "contentFeatures.dlna.org" to "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=${Dlna.FLAGS_IMAGE}"))
+            if (body) out.write(data)
+            return true
+        }
         if (media == null || path != media.urlPath) {
             val msg = "Not found".toByteArray()
             respond(out, 404, "Not Found", listOf("Content-Type" to "text/plain", "Content-Length" to msg.size.toString()))
@@ -267,6 +348,10 @@ class MediaServer(port: Int = DEFAULT_PORT) {
             return true
         }
         media.requested = true
+        // a TV asks for the way it means to fetch; answering in kind keeps strict ones (Sony) happy
+        val transferMode = headers["transfermode.dlna.org"] ?: if (media.kind == MediaKind.IMAGE) "Interactive" else "Streaming"
+        val hub = media.live
+        if (hub != null) return serveLive(hub, media, body, version == "HTTP/1.0", transferMode, out)
         val size = media.source.size
         val range = try {
             parseRange(headers["range"], size)
@@ -276,13 +361,13 @@ class MediaServer(port: Int = DEFAULT_PORT) {
         }
         val (start, end) = range ?: (0L to size - 1)
         val h = mutableListOf(
-            "Content-Type" to media.source.mime,
+            "Content-Type" to media.mime,
             "Content-Length" to (end - start + 1).toString(),
             "Accept-Ranges" to "bytes",
         )
         if (range != null) h += "Content-Range" to "bytes $start-$end/$size"
-        h += "transferMode.dlna.org" to "Streaming"
-        h += "contentFeatures.dlna.org" to DLNA_FEATURES
+        h += "transferMode.dlna.org" to transferMode
+        h += "contentFeatures.dlna.org" to media.features
         // Samsung TVs ask for these; answering like other DLNA servers do keeps their player happy
         val subPath = media.subPath
         if (headers["getcaptioninfo.sec"] != null && subPath != null) {
@@ -304,6 +389,35 @@ class MediaServer(port: Int = DEFAULT_PORT) {
         return true
     }
 
+    /** A live stream has no length and no ranges: 200 and then bytes for as long as it runs, chunked for
+     *  HTTP/1.1 and ended by closing the connection for HTTP/1.0. Returns false: the connection is done. */
+    private fun serveLive(hub: LiveHub, media: Media, body: Boolean, http10: Boolean, transferMode: String, out: OutputStream): Boolean {
+        val h = mutableListOf("Content-Type" to media.mime, "Cache-Control" to "no-cache",
+            "transferMode.dlna.org" to transferMode, "contentFeatures.dlna.org" to media.features)
+        h += if (http10) "Connection" to "close" else "Transfer-Encoding" to "chunked"
+        respond(out, 200, "OK", h)
+        if (!body) return !http10
+        out.flush()
+        val client = hub.open()
+        try {
+            while (!closed) {
+                val chunk = client.read(10_000) ?: break
+                if (chunk.isEmpty()) continue // nothing new yet: keep the TV waiting rather than end its stream
+                if (!http10) out.write("${Integer.toHexString(chunk.size)}\r\n".toByteArray(Charsets.ISO_8859_1))
+                out.write(chunk)
+                if (!http10) out.write(CRLF)
+                out.flush()
+            }
+            if (!http10) {
+                out.write("0\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
+                out.flush()
+            }
+        } finally {
+            client.close()
+        }
+        return false
+    }
+
     private fun respond(out: OutputStream, code: Int, reason: String, headers: List<Pair<String, String>>) {
         val sb = StringBuilder("HTTP/1.1 $code $reason\r\nServer: OpusCast\r\nDate: ${httpDate()}\r\n")
         for ((k, v) in headers) sb.append(k).append(": ").append(v).append("\r\n")
@@ -322,6 +436,8 @@ class MediaServer(port: Int = DEFAULT_PORT) {
         }
     }
 }
+
+private val CRLF = byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
 
 private fun readExactly(input: InputStream, n: Int): ByteArray {
     val buf = ByteArray(n)

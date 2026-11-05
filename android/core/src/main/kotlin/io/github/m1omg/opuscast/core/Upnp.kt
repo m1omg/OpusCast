@@ -127,33 +127,52 @@ class Tv(info: DeviceInfo) {
         val text = String(r.body, Charsets.UTF_8)
         if (r.code >= 400) {
             val detail = xmlTag(text, "errorDescription") ?: "HTTP ${r.code}"
-            throw TvException(TvException.Reason.REFUSED, "$action: $detail")
+            throw TvException(TvException.Reason.REFUSED, "$action: $detail", upnpCode = xmlTag(text, "errorCode")?.trim()?.toIntOrNull())
         }
         return text
     }
 
-    /** true / false from the TV's supported formats, null if it won't say. */
-    fun playsVideo(): Boolean? {
-        val sink = try {
-            xmlTag(soap("ConnectionManager", "GetProtocolInfo", timeoutMs = 3000), "Sink") ?: ""
+    @Volatile private var sinkCache: SinkFormats? = null
+    @Volatile private var sinkFailedAt = 0L
+
+    /** The formats the TV says it plays, asked once (a TV that didn't answer is asked again a minute later). */
+    fun sink(): SinkFormats {
+        sinkCache?.let { return it }
+        if ("ConnectionManager" !in services) return SinkFormats.UNKNOWN.also { sinkCache = it }
+        if (sinkFailedAt != 0L && System.nanoTime() - sinkFailedAt < 60_000_000_000L) return SinkFormats.UNKNOWN
+        return try {
+            SinkFormats.parse(xmlTag(soap("ConnectionManager", "GetProtocolInfo", timeoutMs = 3000), "Sink")).also { sinkCache = it }
         } catch (e: TvException) {
-            return null
+            if (e.reason == TvException.Reason.REFUSED) SinkFormats.UNKNOWN.also { sinkCache = it } // it won't say
+            else SinkFormats.UNKNOWN.also { sinkFailedAt = System.nanoTime() }
         }
-        return if (sink.isNotEmpty()) "video/" in sink else null
     }
 
+    /** true / false from the TV's supported formats, null if it won't say. */
+    fun playsVideo(): Boolean? = sink().playsVideo
+
     // transport
-    fun setMedia(url: String, title: String, mime: String, size: Long, subUrl: String? = null) {
+    fun setMedia(url: String, item: ItemInfo) {
         soap("AVTransport", "SetAVTransportURI", listOf("InstanceID" to 0, "CurrentURI" to url,
-            "CurrentURIMetaData" to didl(url, title, mime, size, subUrl)))
+            "CurrentURIMetaData" to didl(url, item)))
     }
+
+    fun setMedia(url: String, title: String, mime: String, size: Long, subUrl: String? = null) =
+        setMedia(url, ItemInfo(title, mime, size = size, subUrl = subUrl))
 
     fun play() { soap("AVTransport", "Play", listOf("InstanceID" to 0, "Speed" to 1)) }
     fun pause() { soap("AVTransport", "Pause", listOf("InstanceID" to 0)) }
     fun stop(timeoutMs: Int = 6000) { soap("AVTransport", "Stop", listOf("InstanceID" to 0), timeoutMs) }
 
+    /** Jump to [seconds]. Most TVs take REL_TIME; the ones that refuse it get ABS_TIME. */
     fun seek(seconds: Double) {
-        soap("AVTransport", "Seek", listOf("InstanceID" to 0, "Unit" to "REL_TIME", "Target" to upnpTime(seconds.toInt())))
+        val target = upnpTime(seconds.toInt())
+        try {
+            soap("AVTransport", "Seek", listOf("InstanceID" to 0, "Unit" to "REL_TIME", "Target" to target))
+        } catch (e: TvException) {
+            if (e.reason != TvException.Reason.REFUSED) throw e
+            soap("AVTransport", "Seek", listOf("InstanceID" to 0, "Unit" to "ABS_TIME", "Target" to target))
+        }
     }
 
     /** PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING or NO_MEDIA_PRESENT. */
@@ -242,26 +261,61 @@ class Tv(info: DeviceInfo) {
     }
 }
 
-/** The DIDL-Lite metadata sent with the video. Subtitles are announced the Samsung (sec:), LG/Sony/
- *  others (pv:) and plain DLNA ways. */
-internal fun didl(url: String, title: String, mime: String, size: Long, subUrl: String?): String {
+/** What the TV is told about what it is asked to play (the DIDL-Lite metadata). */
+class ItemInfo(
+    val title: String,
+    val mime: String,
+    val features: String = DLNA_FEATURES,
+    /** Bytes; null for a live stream, which has no length. */
+    val size: Long? = null,
+    val kind: MediaKind = MediaKind.VIDEO,
+    val subUrl: String? = null,
+    val durationMs: Long? = null,
+    val artist: String? = null,
+    val album: String? = null,
+    val coverUrl: String? = null,
+    val coverJpeg: Boolean = false,
+)
+
+/** The DIDL-Lite metadata sent with the item. Subtitles are announced the Samsung (sec:), LG/Sony/others
+ *  (pv:) and plain DLNA ways; music gets artist, album and cover the way DLNA servers send them. */
+internal fun didl(url: String, item: ItemInfo): String {
     val e = ::xmlEscape
-    var resExtra = ""
+    val res = StringBuilder()
+    item.size?.takeIf { it >= 0 }?.let { res.append(" size=\"$it\"") }
+    item.durationMs?.takeIf { it > 0 }?.let { res.append(" duration=\"${didlDuration(it)}\"") }
     var subCaption = ""
-    if (subUrl != null) {
-        resExtra = " pv:subtitleFileType=\"srt\" pv:subtitleFileUri=\"${e(subUrl)}\""
+    val subUrl = item.subUrl
+    if (subUrl != null && item.kind == MediaKind.VIDEO) {
+        res.append(" pv:subtitleFileType=\"srt\" pv:subtitleFileUri=\"${e(subUrl)}\"")
         subCaption = "<res protocolInfo=\"http-get:*:text/srt:*\">${e(subUrl)}</res>" +
             "<sec:CaptionInfoEx sec:type=\"srt\">${e(subUrl)}</sec:CaptionInfoEx>" +
             "<sec:CaptionInfo sec:type=\"srt\">${e(subUrl)}</sec:CaptionInfo>"
     }
+    val cls = when (item.kind) {
+        MediaKind.AUDIO -> "object.item.audioItem.musicTrack"
+        MediaKind.IMAGE -> "object.item.imageItem.photo"
+        MediaKind.VIDEO, MediaKind.LIVE -> "object.item.videoItem"
+    }
+    val meta = StringBuilder()
+    if (item.kind == MediaKind.AUDIO) {
+        item.artist?.takeIf { it.isNotBlank() }?.let { meta.append("<dc:creator>${e(it)}</dc:creator><upnp:artist>${e(it)}</upnp:artist>") }
+        item.album?.takeIf { it.isNotBlank() }?.let { meta.append("<upnp:album>${e(it)}</upnp:album>") }
+        item.coverUrl?.let {
+            meta.append("<upnp:albumArtURI").append(if (item.coverJpeg) " dlna:profileID=\"JPEG_TN\"" else "").append(">${e(it)}</upnp:albumArtURI>")
+        }
+    }
     return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
         "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
-        "xmlns:sec=\"http://www.sec.co.kr/\" xmlns:pv=\"http://www.pv.com/pvns/\">" +
-        "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>${e(title)}</dc:title>" +
-        "<upnp:class>object.item.videoItem</upnp:class>" +
-        "<res protocolInfo=\"http-get:*:$mime:$DLNA_FEATURES\" size=\"$size\"$resExtra>${e(url)}</res>" +
+        "xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" xmlns:sec=\"http://www.sec.co.kr/\" xmlns:pv=\"http://www.pv.com/pvns/\">" +
+        "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>${e(item.title)}</dc:title>" +
+        "<upnp:class>$cls</upnp:class>$meta" +
+        "<res protocolInfo=\"http-get:*:${item.mime}:${item.features}\"$res>${e(url)}</res>" +
         "$subCaption</item></DIDL-Lite>"
 }
+
+internal fun didl(url: String, title: String, mime: String, size: Long, subUrl: String?): String =
+    didl(url, ItemInfo(title, mime, size = size, subUrl = subUrl))
 
 /** A GENA NOTIFY body -> {variable: value} of what changed.
  *  {} means the TV said "something changed" without details; null means not a LastChange event. */
@@ -309,13 +363,15 @@ internal fun loadTvs(locations: List<String>): List<Tv> {
     }
 }
 
-/** Remembered location first (fast), then SSDP, then the Samsung default port. */
+/** Remembered location first (fast), then SSDP, then the Samsung default port. Without a remembered one,
+ *  a renderer that plays video goes before speakers that only play music. */
 fun findTv(location: String? = null, host: String? = null, timeoutMs: Long = 3000,
            bindAddress: java.net.InetAddress? = null): Tv? {
     if (location != null) {
         runCatching { Tv.fromLocation(location, 2500) }.getOrNull()?.let { if (host == null || it.host == host) return it }
     }
-    discover(timeoutMs, bindAddress).firstOrNull { host == null || it.host == host }?.let { return it }
+    val found = discover(timeoutMs, bindAddress).filter { host == null || it.host == host }
+    (found.firstOrNull { it.playsVideo() != false } ?: found.firstOrNull())?.let { return it }
     if (host != null) {
         runCatching { Tv.fromLocation("http://$host:9197/dmr", 2500) }.getOrNull()?.let { return it }
     }

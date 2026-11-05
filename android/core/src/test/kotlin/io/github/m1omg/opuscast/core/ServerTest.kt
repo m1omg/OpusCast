@@ -101,4 +101,78 @@ class ServerTest {
         val extra = server.addSubtitle(media, "x".toByteArray())
         assertEquals("x", open(extra).inputStream.readBytes().decodeToString())
     }
+
+    @Test fun photosCoversAndTheTvsSpelling() {
+        val jpeg = ByteArray(5000) { it.toByte() }
+        val media = server.publish(BytesSource("IMG_1.jpg", jpeg, kind = MediaKind.IMAGE), mime = "image/jpg",
+            features = Dlna.image("image/jpeg", 800, 600, converted = true))
+        assertTrue(media.urlPath.endsWith(".jpg"))
+        val c = open(media.urlPath)
+        assertEquals(200, c.responseCode)
+        assertEquals("image/jpg", c.contentType) // as this TV spells it
+        assertEquals("Interactive", c.getHeaderField("transferMode.dlna.org"))
+        assertTrue(c.getHeaderField("contentFeatures.dlna.org").startsWith("DLNA.ORG_PN=JPEG_MED;DLNA.ORG_OP=00;DLNA.ORG_CI=1"))
+        assertEquals(jpeg.toList(), c.inputStream.readBytes().toList())
+        // a TV that says how it fetches gets the same back
+        assertEquals("Background", open(media.urlPath, headers = mapOf("transferMode.dlna.org" to "Background"))
+            .getHeaderField("transferMode.dlna.org"))
+        val song = server.publish(FileSource(file.copyTo(File(file.parentFile, "Song-${System.nanoTime()}.flac")).apply { deleteOnExit() }))
+        val cover = server.addExtra(song, ".png", "image/png", byteArrayOf(9, 8, 7))
+        val cc = open(cover)
+        assertEquals("image/png", cc.contentType)
+        assertEquals(listOf<Byte>(9, 8, 7), cc.inputStream.readBytes().toList())
+        val sc = open(song.urlPath, "HEAD")
+        assertEquals("audio/flac", sc.contentType)
+        assertEquals("Streaming", sc.getHeaderField("transferMode.dlna.org"))
+    }
+
+    private fun liveStream(): Pair<LiveHub, Media> {
+        val hub = LiveHub()
+        val mux = TsMuxer { b, o, l -> hub.write(b, o, l) }
+        mux.setVideoConfig(FAKE_CONFIG)
+        for (n in 0 until 5) {
+            val (f, key) = fakeFrame(n, gop = 30, size = 2000)
+            mux.writeVideo(f, 0, f.size, n * 33_333L, key)
+        }
+        return hub to server.publishLive(hub, "Phone screen")
+    }
+
+    @Test fun liveStreamOverHttp11IsChunked() {
+        val (hub, media) = liveStream()
+        val head = open(media.urlPath, "HEAD")
+        assertEquals(200, head.responseCode)
+        assertNull(head.getHeaderField("Content-Length"))
+        assertEquals(Dlna.LIVE, head.getHeaderField("contentFeatures.dlna.org"))
+        val c = open(media.urlPath, headers = mapOf("Range" to "bytes=0-"))
+        assertEquals(200, c.responseCode) // never 206: there's nothing to range over
+        assertEquals("chunked", c.getHeaderField("Transfer-Encoding"))
+        assertEquals("video/mpeg", c.contentType)
+        assertEquals("no-cache", c.getHeaderField("Cache-Control"))
+        val input = c.inputStream
+        val first = ByteArray(188)
+        var n = 0
+        while (n < 188) n += input.read(first, n, 188 - n)
+        assertEquals(0x47, first.u(0))
+        assertEquals(0, pidOf(first)) // the PAT first
+        assertTrue(media.requested)
+        hub.close()
+        val rest = input.readBytes() // ends with the stream (the last chunk)
+        assertEquals(0, (188 + rest.size) % 188)
+    }
+
+    @Test fun liveStreamOverHttp10EndsWithTheConnection() {
+        val (hub, media) = liveStream()
+        Socket("127.0.0.1", server.port).use { s ->
+            s.getOutputStream().write("GET ${media.urlPath} HTTP/1.0\r\n\r\n".toByteArray())
+            val input = BufferedInputStream(s.getInputStream())
+            val head = readHead(input)!!
+            assertTrue(head.startsWith("HTTP/1.1 200"), head)
+            assertTrue("Connection: close" in head && "chunked" !in head && "Content-Length" !in head, head)
+            val b = input.read()
+            assertEquals(0x47, b)
+            hub.close()
+            val rest = input.readBytes()
+            assertEquals(0, (1 + rest.size) % 188)
+        }
+    }
 }
