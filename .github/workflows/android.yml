@@ -13,6 +13,8 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  # the Release workflow (release.yml) builds the app through this one
+  workflow_call:
 
 jobs:
   build:
