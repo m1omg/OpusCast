@@ -2,8 +2,13 @@ package io.github.m1omg.opuscast.core
 
 /** Something the TV (or a file) didn't do. [reason] picks the message the app shows; [detail] is
  *  the raw text from the TV or the system, shown in brackets. */
-class TvException(val reason: Reason, val detail: String = "", cause: Throwable? = null) :
-    Exception(if (detail.isEmpty()) reason.name else "${reason.name}: $detail", cause) {
+class TvException(
+    val reason: Reason,
+    val detail: String = "",
+    cause: Throwable? = null,
+    /** The UPnP errorCode the TV answered with (e.g. 701 "transition not available"), when it gave one. */
+    val upnpCode: Int? = null,
+) : Exception(if (detail.isEmpty()) reason.name else "${reason.name}: $detail", cause) {
 
     enum class Reason {
         /** The device has no AVTransport service. */

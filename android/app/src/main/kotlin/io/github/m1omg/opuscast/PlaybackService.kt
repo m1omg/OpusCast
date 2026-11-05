@@ -1,5 +1,6 @@
 package io.github.m1omg.opuscast
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,9 +8,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.MediaMetadata
 import android.media.VolumeProvider
+import android.media.projection.MediaProjectionManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.net.wifi.WifiManager
@@ -19,6 +22,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
@@ -37,6 +41,11 @@ class PlaybackService : Service() {
         private const val ACTION_BACK = "io.github.m1omg.opuscast.BACK"
         private const val ACTION_FORWARD = "io.github.m1omg.opuscast.FORWARD"
         private const val ACTION_STOP = "io.github.m1omg.opuscast.STOP"
+        private const val ACTION_NEXT = "io.github.m1omg.opuscast.NEXT"
+        private const val ACTION_PREVIOUS = "io.github.m1omg.opuscast.PREVIOUS"
+        private const val ACTION_SCREEN = "io.github.m1omg.opuscast.SCREEN"
+        private const val EXTRA_CODE = "code"
+        private const val EXTRA_DATA = "data"
         /** Long enough for any film; renewed whenever a video starts, released when playback ends. */
         private const val WAKE_MS = 6 * 60 * 60 * 1000L
 
@@ -45,6 +54,17 @@ class PlaybackService : Service() {
                 ContextCompat.startForegroundService(context, Intent(context, PlaybackService::class.java))
             } catch (e: Exception) {
                 // not allowed from the background (Android 12+); playback still works while the app is open
+            }
+        }
+
+        /** The user allowed screen capture: Android wants the projection taken in a foreground service that
+         *  already runs as the "media projection" kind (Android 14), so the service takes it. */
+        fun startScreen(context: Context, resultCode: Int, data: Intent) {
+            try {
+                ContextCompat.startForegroundService(context, Intent(context, PlaybackService::class.java)
+                    .setAction(ACTION_SCREEN).putExtra(EXTRA_CODE, resultCode).putExtra(EXTRA_DATA, data))
+            } catch (e: Exception) {
+                context.engine.screenRefused(e.message ?: e.javaClass.simpleName)
             }
         }
     }
@@ -57,7 +77,11 @@ class PlaybackService : Service() {
     private var shownTitle: String? = null
     private var shownPlaying: Boolean? = null
     private var lastState: Triple<Int, Long, Long>? = null // (state, position ms, elapsedRealtime when set)
+    private var shownMode: PlayerMode? = null
+    private var shownArt: android.graphics.Bitmap? = null
     private var foreground = false
+    /** The foreground service types it runs as now (screen capture adds media projection). */
+    private var types = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -76,8 +100,8 @@ class PlaybackService : Service() {
                 override fun onSeekTo(pos: Long) = engine.seekTo(pos / 1000.0)
                 override fun onFastForward() = engine.skip(10.0)
                 override fun onRewind() = engine.skip(-10.0)
-                override fun onSkipToNext() = engine.skip(30.0)
-                override fun onSkipToPrevious() = engine.skip(-30.0)
+                override fun onSkipToNext() = engine.next()
+                override fun onSkipToPrevious() = engine.previous()
                 override fun onCustomAction(action: String, extras: android.os.Bundle?) {
                     when (action) {
                         ACTION_BACK -> engine.skip(-10.0)
@@ -103,6 +127,10 @@ class PlaybackService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_SCREEN) {
+            takeScreen(intent)
+            return START_NOT_STICKY
+        }
         // every startForegroundService() must be answered with startForeground()
         goForeground(shownTitle ?: getString(R.string.app_name), shownPlaying ?: false)
         runCatching { wakeLock?.acquire(WAKE_MS) } // a new video: the full time again
@@ -110,10 +138,43 @@ class PlaybackService : Service() {
             ACTION_TOGGLE -> engine.togglePlay()
             ACTION_BACK -> engine.skip(-10.0)
             ACTION_FORWARD -> engine.skip(10.0)
+            ACTION_NEXT -> engine.next()
+            ACTION_PREVIOUS -> engine.previous()
             ACTION_STOP -> engine.stopFromNotification()
         }
         if (!engine.hasSession) stopSelfSoon()
         return START_NOT_STICKY
+    }
+
+    /** Become a "media projection" foreground service first, then take the projection (Android 14's order). */
+    private fun takeScreen(intent: Intent) {
+        val code = intent.getIntExtra(EXTRA_CODE, 0)
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+        try {
+            goForeground(getString(R.string.screen_title), false, screen = true)
+        } catch (e: Exception) {
+            goForeground(shownTitle ?: getString(R.string.app_name), false)
+            engine.screenRefused(e.message ?: e.javaClass.simpleName)
+            if (!engine.hasSession) stopSelfSoon()
+            return
+        }
+        runCatching { wakeLock?.acquire(WAKE_MS) }
+        val projection = try {
+            data?.let { getSystemService(MediaProjectionManager::class.java).getMediaProjection(code, it) }
+        } catch (e: Exception) {
+            null
+        }
+        if (projection == null) {
+            engine.screenRefused()
+            goForeground(shownTitle ?: getString(R.string.app_name), false)
+            if (!engine.hasSession) stopSelfSoon()
+            return
+        }
+        engine.screenGranted(projection)
+        if (!engine.screenActive) {
+            goForeground(shownTitle ?: getString(R.string.app_name), false)
+            if (!engine.hasSession) stopSelfSoon()
+        }
     }
 
     private fun stopSelfSoon() {
@@ -132,10 +193,25 @@ class PlaybackService : Service() {
     private fun action(name: String, code: Int) = PendingIntent.getService(this, code,
         Intent(this, PlaybackService::class.java).setAction(name), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
-    private fun notification(title: String, playing: Boolean): Notification {
+    @Suppress("DEPRECATION") // the Icon-less Action.Builder: the resource-id one works on every Android version here
+    private fun notification(title: String, playing: Boolean, mode: PlayerMode): Notification {
         val tv = engine.tvNameNow
-        @Suppress("DEPRECATION")
-        return Notification.Builder(this, CHANNEL)
+        fun act(icon: Int, label: Int, name: String, code: Int) =
+            Notification.Action.Builder(icon, getString(label), action(name, code)).build()
+        val pause = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val stop = act(android.R.drawable.ic_menu_close_clear_cancel, R.string.stop, ACTION_STOP, 4)
+        val actions = when (mode) {
+            PlayerMode.MUSIC, PlayerMode.PHOTO -> listOf(
+                act(android.R.drawable.ic_media_previous, R.string.previous, ACTION_PREVIOUS, 5),
+                act(pause, if (mode == PlayerMode.PHOTO) R.string.slideshow else R.string.play_pause, ACTION_TOGGLE, 2),
+                act(android.R.drawable.ic_media_next, R.string.next, ACTION_NEXT, 6), stop)
+            PlayerMode.SCREEN -> listOf(stop)
+            PlayerMode.VIDEO, PlayerMode.INTRO -> listOf(
+                act(android.R.drawable.ic_media_rew, R.string.back_10, ACTION_BACK, 1),
+                act(pause, R.string.play_pause, ACTION_TOGGLE, 2),
+                act(android.R.drawable.ic_media_ff, R.string.forward_10, ACTION_FORWARD, 3), stop)
+        }
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_opuscast)
             .setContentTitle(title)
             .setContentText(if (tv != null) getString(R.string.notification_text, tv) else getString(R.string.app_name))
@@ -144,26 +220,50 @@ class PlaybackService : Service() {
             .setShowWhen(false)
             .setCategory(Notification.CATEGORY_TRANSPORT)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .addAction(Notification.Action.Builder(android.R.drawable.ic_media_rew, getString(R.string.back_10), action(ACTION_BACK, 1)).build())
-            .addAction(Notification.Action.Builder(if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
-                getString(R.string.play_pause), action(ACTION_TOGGLE, 2)).build())
-            .addAction(Notification.Action.Builder(android.R.drawable.ic_media_ff, getString(R.string.forward_10), action(ACTION_FORWARD, 3)).build())
-            .addAction(Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.stop), action(ACTION_STOP, 4)).build())
-            .setStyle(Notification.MediaStyle().setMediaSession(media.sessionToken).setShowActionsInCompactView(0, 1, 2))
-            .build()
+        actions.forEach { b.addAction(it) }
+        val compact = if (actions.size >= 3) intArrayOf(0, 1, 2) else intArrayOf(0)
+        return b.setStyle(Notification.MediaStyle().setMediaSession(media.sessionToken).setShowActionsInCompactView(*compact)).build()
     }
 
-    private fun goForeground(title: String, playing: Boolean) {
-        val n = notification(title, playing)
-        if (!foreground) {
-            ServiceCompat.startForeground(this, NOTIFICATION, n,
-                if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0)
+    /** Foreground with the notification, as the kinds of service it is now: media playback, plus media
+     *  projection (and recording what apps play) while the screen is cast. */
+    private fun goForeground(title: String, playing: Boolean, screen: Boolean = engine.screenActive) {
+        val mode = if (screen) PlayerMode.SCREEN else engine.ui.value.player?.mode ?: PlayerMode.VIDEO
+        val n = notification(title, playing, mode)
+        var want = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0
+        if (screen && Build.VERSION.SDK_INT >= 29) {
+            want = want or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (Build.VERSION.SDK_INT >= 30 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                want = want or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+        }
+        if (!foreground || want != types) {
+            try {
+                ServiceCompat.startForeground(this, NOTIFICATION, n, want)
+            } catch (e: SecurityException) {
+                if (Build.VERSION.SDK_INT < 30 || want and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE == 0) throw e
+                want = want and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE.inv() // the picture without the sound then
+                ServiceCompat.startForeground(this, NOTIFICATION, n, want)
+            }
             foreground = true
+            types = want
         } else {
             getSystemService(NotificationManager::class.java).notify(NOTIFICATION, n)
         }
         shownTitle = title
         shownPlaying = playing
+        shownMode = mode
+    }
+
+    private fun metadata(ui: UiState, p: PlayerUi, clock: Clock) {
+        val b = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, p.title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, p.artist ?: ui.tvName ?: "")
+            .putLong(MediaMetadata.METADATA_KEY_DURATION, (clock.dur * 1000).toLong())
+        p.album?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM, it) }
+        p.art?.let { b.putBitmap(MediaMetadata.METADATA_KEY_ART, it) }
+        media.setMetadata(b.build())
+        shownArt = p.art
     }
 
     private fun update(ui: UiState, clock: Clock) {
@@ -173,35 +273,41 @@ class PlaybackService : Service() {
         }
         val p = ui.player ?: return
         val title = p.title
-        if (title != shownTitle || p.playing != shownPlaying) {
-            goForeground(title, p.playing)
-            media.setMetadata(MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, ui.tvName ?: "")
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, (clock.dur * 1000).toLong())
-                .build())
+        // photos don't play: what shows as playing is the slideshow
+        val playing = if (p.mode == PlayerMode.PHOTO) p.slideshow else p.playing
+        if (title != shownTitle || playing != shownPlaying || p.mode != shownMode) {
+            goForeground(title, playing)
+            metadata(ui, p, clock)
+        } else if (p.art !== shownArt) {
+            metadata(ui, p, clock)
         }
         // the system moves the position along by itself; tell it again only when it's off (seek, pause)
-        val state = if (p.playing) PlaybackState.STATE_PLAYING else if (p.seekable) PlaybackState.STATE_PAUSED else PlaybackState.STATE_BUFFERING
-        val posMs = (clock.pos * 1000).toLong()
+        val state = if (playing) PlaybackState.STATE_PLAYING else if (p.seekable || p.mode == PlayerMode.PHOTO) PlaybackState.STATE_PAUSED
+            else PlaybackState.STATE_BUFFERING
+        val posMs = if (p.mode == PlayerMode.PHOTO || p.mode == PlayerMode.SCREEN) PlaybackState.PLAYBACK_POSITION_UNKNOWN else (clock.pos * 1000).toLong()
         val nowMs = SystemClock.elapsedRealtime()
         val last = lastState
         val expected = if (last == null) -1L else last.second + if (last.first == PlaybackState.STATE_PLAYING) nowMs - last.third else 0
-        if (last == null || last.first != state || Math.abs(expected - posMs) > 2000) {
+        if (last == null || last.first != state || Math.abs(expected - posMs) > 2000 || (posMs < 0 && last.second >= 0)) {
             lastState = Triple(state, posMs, nowMs)
-            media.setPlaybackState(PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
-                    PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_STOP or PlaybackState.ACTION_FAST_FORWARD or
-                    PlaybackState.ACTION_REWIND)
-                .addCustomAction(PlaybackState.CustomAction.Builder(ACTION_BACK, getString(R.string.back_10), android.R.drawable.ic_media_rew).build())
-                .addCustomAction(PlaybackState.CustomAction.Builder(ACTION_FORWARD, getString(R.string.forward_10), android.R.drawable.ic_media_ff).build())
-                .setState(state, posMs, if (p.playing) 1f else 0f, nowMs)
-                .build())
-            if (clock.dur > 0) media.setMetadata(MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, ui.tvName ?: "")
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, (clock.dur * 1000).toLong())
-                .build())
+            val actions = when (p.mode) {
+                PlayerMode.MUSIC -> PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_STOP or PlaybackState.ACTION_SKIP_TO_NEXT or
+                    PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                PlayerMode.PHOTO -> PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_STOP or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                PlayerMode.SCREEN -> PlaybackState.ACTION_STOP
+                PlayerMode.VIDEO, PlayerMode.INTRO -> PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_STOP or
+                    PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND
+            }
+            val ps = PlaybackState.Builder().setActions(actions).setState(state, posMs, if (playing) 1f else 0f, nowMs)
+            if (p.mode == PlayerMode.VIDEO || p.mode == PlayerMode.INTRO) {
+                ps.addCustomAction(PlaybackState.CustomAction.Builder(ACTION_BACK, getString(R.string.back_10), android.R.drawable.ic_media_rew).build())
+                ps.addCustomAction(PlaybackState.CustomAction.Builder(ACTION_FORWARD, getString(R.string.forward_10), android.R.drawable.ic_media_ff).build())
+            }
+            media.setPlaybackState(ps.build())
+            if (clock.dur > 0) metadata(ui, p, clock)
         }
         // the phone's volume buttons set the TV's volume
         val v = ui.volume

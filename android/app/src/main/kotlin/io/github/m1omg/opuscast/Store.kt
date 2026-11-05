@@ -13,6 +13,10 @@ class Settings(
     var preview: Boolean = false,
     var intro: Boolean = false,
     val recent: RecentList = RecentList(),
+    /** Seconds each photo stays on in a slideshow. */
+    var slideSeconds: Int = 5,
+    /** Cast the screen in 1080p (else 720p, lighter on the Wi-Fi). */
+    var screenHd: Boolean = true,
 )
 
 /** Settings as JSON in the app's private files (like ~/.config/opuscast/config.json on Linux). */
@@ -30,7 +34,8 @@ class Store(dir: File) {
                 r.optBoolean("watched", false), if (r.isNull("sub")) null else r.optString("sub").ifEmpty { null })
         }
         Settings(tv?.optString("location")?.ifEmpty { null }, tv?.optString("name")?.ifEmpty { null },
-            o.optBoolean("preview", false), o.optBoolean("intro", false), RecentList(recent))
+            o.optBoolean("preview", false), o.optBoolean("intro", false), RecentList(recent),
+            o.optInt("slide_seconds", 5), o.optBoolean("screen_hd", true))
     } catch (e: Exception) {
         Settings()
     }
@@ -40,6 +45,8 @@ class Store(dir: File) {
         if (s.tvLocation != null) o.put("tv", JSONObject().put("location", s.tvLocation).put("name", s.tvName ?: ""))
         o.put("preview", s.preview)
         o.put("intro", s.intro)
+        o.put("slide_seconds", s.slideSeconds)
+        o.put("screen_hd", s.screenHd)
         o.put("recent", JSONArray().apply {
             for (r in s.recent.items) put(JSONObject().put("ref", r.ref).put("name", r.name).put("pos", r.pos)
                 .put("dur", r.dur).put("watched", r.watched).put("sub", r.sub ?: JSONObject.NULL))

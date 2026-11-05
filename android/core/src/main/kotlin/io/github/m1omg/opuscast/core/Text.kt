@@ -15,6 +15,12 @@ fun parseTime(text: String?): Int? {
     return h * 3600 + m.groupValues[2].toInt() * 60 + m.groupValues[3].toInt()
 }
 
+/** Milliseconds -> "0:03:25.000", the DIDL-Lite res@duration form. */
+fun didlDuration(ms: Long): String {
+    val t = maxOf(0L, ms)
+    return "%d:%02d:%02d.%03d".format(t / 3_600_000, t / 60_000 % 60, t / 1000 % 60, t % 1000)
+}
+
 /** Seconds -> "HH:MM:SS" as UPnP Seek wants it. */
 fun upnpTime(seconds: Int): String {
     val s = maxOf(0, seconds)

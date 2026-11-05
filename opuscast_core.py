@@ -35,6 +35,7 @@ APP_ID = "io.github.m1omg.OpusCast"
 DEFAULT_PORT = 8765
 RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
 DLNA_FEATURES = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+LIVE_FEATURES = "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"  # no seeking
 MIME = {
     ".mkv": "video/x-mkv", ".mp4": "video/mp4", ".m4v": "video/mp4",
     ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".webm": "video/webm",
@@ -43,6 +44,36 @@ MIME = {
     ".flv": "video/x-flv", ".wmv": "video/x-ms-asf", ".3gp": "video/3gpp",
 }
 VIDEO_EXTS = tuple(MIME)
+AUDIO_MIME = {
+    ".mp3": "audio/mpeg", ".flac": "audio/flac", ".m4a": "audio/mp4", ".m4b": "audio/mp4", ".alac": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav",
+    ".wma": "audio/x-ms-wma", ".aif": "audio/aiff", ".aiff": "audio/aiff", ".mka": "audio/x-matroska",
+}
+AUDIO_EXTS = tuple(AUDIO_MIME)
+IMAGE_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".bmp": "image/bmp",
+    ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heic", ".avif": "image/avif",
+    ".tif": "image/tiff", ".tiff": "image/tiff",
+}
+IMAGE_EXTS = tuple(IMAGE_MIME)
+# The same format under the names different TVs know it by. We send whichever the TV lists itself
+# (Samsung says video/x-mkv, others video/x-matroska; audio/flac or audio/x-flac...).
+MIME_ALIASES = (
+    ("video/x-matroska", "video/x-mkv", "video/mkv"),
+    ("video/mp4", "video/mpeg4"),
+    ("video/x-msvideo", "video/avi", "video/x-avi", "video/divx"),
+    ("video/quicktime", "video/mov"),
+    ("video/mp2t", "video/mpeg", "video/vnd.dlna.mpeg-tts"),
+    ("video/x-ms-wmv", "video/x-ms-asf"),
+    ("audio/flac", "audio/x-flac"),
+    ("audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac"),
+    ("audio/aac", "audio/x-aac", "audio/vnd.dlna.adts", "audio/aacp"),
+    ("audio/wav", "audio/x-wav", "audio/wave"),
+    ("audio/ogg", "application/ogg", "audio/x-ogg"),
+    ("audio/aiff", "audio/x-aiff"),
+    ("image/jpeg", "image/jpg"),
+)
+_ALIASES = {m: group for group in MIME_ALIASES for m in group}
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "opuscast")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "opuscast")
@@ -50,7 +81,11 @@ DESC_ERRORS = (OSError, ET.ParseError, ValueError)
 
 
 class TVError(Exception):
-    pass
+    """A TV command that failed. code is the UPnP error code when the TV answered with one."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 BLANK_SRT = b"1\n99:00:00,000 --> 99:00:01,000\n \n"  # what the TV shows for "subtitles off"
@@ -84,6 +119,101 @@ def local_ip_towards(host):
 
 def have(tool):
     return shutil.which(tool) is not None
+
+
+def media_kind(path):
+    """'video', 'audio', 'image' or None, from the file name."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in MIME:
+        return "video"
+    if ext in AUDIO_MIME:
+        return "audio"
+    if ext in IMAGE_MIME:
+        return "image"
+    import mimetypes
+    guess = (mimetypes.guess_type(path)[0] or "").split("/")[0]
+    return {"video": "video", "audio": "audio", "image": "image"}.get(guess)
+
+
+def mime_of(path, kind=None):
+    ext = os.path.splitext(path)[1].lower()
+    kind = kind or media_kind(path)
+    if kind == "audio":
+        return AUDIO_MIME.get(ext, "audio/mpeg")
+    if kind == "image":
+        return IMAGE_MIME.get(ext, "image/jpeg")
+    return MIME.get(ext, "video/mp4")
+
+
+def parse_sink(text):
+    """ConnectionManager's Sink list ("http-get:*:video/mp4:*,...") -> {lower-case MIME: the TV's spelling}.
+    A TV that takes anything lists "*"."""
+    mimes = {}
+    for entry in (text or "").split(","):
+        parts = entry.strip().split(":")
+        if len(parts) >= 3 and parts[0].strip().lower() in ("http-get", "*"):
+            spelled = parts[2].split(";")[0].strip()
+            if spelled:
+                mimes.setdefault(spelled.lower(), spelled)
+    return mimes
+
+
+def pick_mime(mime, sink):
+    """The name a TV knows our format by: ours if it lists it (or won't say), else the alias it lists."""
+    if not sink or "*" in sink:
+        return mime
+    if mime.lower() in sink:
+        return sink[mime.lower()]
+    for alias in _ALIASES.get(mime, ()):
+        if alias.lower() in sink:
+            return sink[alias.lower()]
+    return mime
+
+
+def didl_time(seconds):
+    ms = max(0, int(round(seconds * 1000)))
+    return f"{ms // 3600000}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+
+
+def didl(url, title, mime, size=None, kind="video", features=DLNA_FEATURES, sub_url=None, meta=None):
+    """The DIDL-Lite description the TV gets with the URL: what it is (video, song, photo), its format,
+    and for songs the artist, album and cover. Subtitles are announced the Samsung (sec:), LG/Sony/
+    others (pv:) and plain DLNA ways."""
+    e, meta = html.escape, meta or {}
+    upnp_class = {"audio": "object.item.audioItem.musicTrack", "image": "object.item.imageItem.photo"}.get(
+        kind, "object.item.videoItem")
+    res_attrs = f' size="{size}"' if size else ""
+    if meta.get("duration"):
+        res_attrs += f' duration="{didl_time(meta["duration"])}"'
+    if meta.get("resolution"):
+        res_attrs += f' resolution="{meta["resolution"]}"'
+    extra = sub_caption = ""
+    if sub_url:
+        res_attrs += f' pv:subtitleFileType="srt" pv:subtitleFileUri="{e(sub_url)}"'
+        sub_caption = (f'<res protocolInfo="http-get:*:text/srt:*">{e(sub_url)}</res>'
+                       f'<sec:CaptionInfoEx sec:type="srt">{e(sub_url)}</sec:CaptionInfoEx>'
+                       f'<sec:CaptionInfo sec:type="srt">{e(sub_url)}</sec:CaptionInfo>')
+    if kind == "audio":
+        artist = meta.get("artist") or meta.get("albumartist")
+        if artist:
+            extra += f"<dc:creator>{e(artist)}</dc:creator><upnp:artist>{e(artist)}</upnp:artist>"
+        if meta.get("album"):
+            extra += f"<upnp:album>{e(meta['album'])}</upnp:album>"
+        if meta.get("track"):
+            extra += f"<upnp:originalTrackNumber>{int(meta['track'])}</upnp:originalTrackNumber>"
+        if meta.get("cover_url"):
+            profile = ' dlna:profileID="JPEG_TN"' if meta.get("cover_mime") == "image/jpeg" else ""
+            extra += f'<upnp:albumArtURI{profile}>{e(meta["cover_url"])}</upnp:albumArtURI>'
+    return (
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" '
+        'xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/">'
+        f'<item id="0" parentID="-1" restricted="1"><dc:title>{e(title)}</dc:title>'
+        f'<upnp:class>{upnp_class}</upnp:class>{extra}'
+        f'<res protocolInfo="http-get:*:{mime}:{features}"{res_attrs}>{e(url)}</res>'
+        f'{sub_caption}</item></DIDL-Lite>'
+    )
 
 
 def _ssdp(search_target, timeout):
@@ -190,6 +320,7 @@ class TV:
         self.model = info["model"]
         self.services = info["services"]
         self._actions = {}
+        self._sink = None
 
     def __repr__(self):
         return f"TV({self.name!r} at {self.host})"
@@ -218,39 +349,51 @@ class TV:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read().decode(errors="ignore")
         except urllib.error.HTTPError as e:
-            detail = _tag(e.read().decode(errors="ignore"), "errorDescription")
-            raise TVError(_("the TV refused {action}: {detail}").format(action=action, detail=detail or e.reason)) from None
+            body = e.read().decode(errors="ignore")
+            detail, code = _tag(body, "errorDescription"), (_tag(body, "errorCode") or "").strip()
+            raise TVError(_("the TV refused {action}: {detail}").format(action=action, detail=detail or e.reason),
+                          int(code) if code.isdigit() else None) from None
         except OSError as e:
             raise TVError(_("can't reach the TV ({error})").format(error=e)) from None
 
+    def sink(self):
+        """The formats the TV says it plays, {lower-case MIME: its spelling}, or None if it won't say."""
+        if self._sink is None:
+            try:
+                text = _tag(self.soap("ConnectionManager", "GetProtocolInfo", timeout=3), "Sink") or ""
+            except TVError:
+                return None  # ask again next time
+            self._sink = parse_sink(text)
+        return self._sink or None
+
+    def cached_sink(self):
+        """sink() without asking the TV: None until it has been asked."""
+        return self._sink or None
+
     def plays_video(self):
         """True / False from the TV's supported formats, None if it won't say."""
-        try:
-            sink = _tag(self.soap("ConnectionManager", "GetProtocolInfo", timeout=3), "Sink") or ""
-        except TVError:
+        sink = self.sink()
+        return None if sink is None else "*" in sink or any(m.startswith("video/") for m in sink)
+
+    def plays_audio(self):
+        sink = self.sink()
+        return None if sink is None else "*" in sink or any(m.startswith("audio/") for m in sink)
+
+    def accepts(self, mime):
+        """True / False: does the TV list this format (under any of its names)? None if it won't say."""
+        sink = self.sink()
+        if not sink:
             return None
-        return "video/" in sink if sink else None
+        return "*" in sink or any(m.lower() in sink for m in (mime,) + _ALIASES.get(mime, ()))
+
+    def pick_mime(self, mime):
+        return pick_mime(mime, self.sink())
 
     # transport
-    def set_media(self, url, title, mime, size, sub_url=None):
-        e = html.escape
-        res_extra = sub_caption = ""
-        if sub_url:  # Samsung (sec:), LG/Sony/others (pv:) and plain DLNA ways of announcing subtitles
-            res_extra = f' pv:subtitleFileType="srt" pv:subtitleFileUri="{e(sub_url)}"'
-            sub_caption = (f'<res protocolInfo="http-get:*:text/srt:*">{e(sub_url)}</res>'
-                           f'<sec:CaptionInfoEx sec:type="srt">{e(sub_url)}</sec:CaptionInfoEx>'
-                           f'<sec:CaptionInfo sec:type="srt">{e(sub_url)}</sec:CaptionInfo>')
-        didl = (
-            '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-            'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-            'xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/">'
-            f'<item id="0" parentID="-1" restricted="1"><dc:title>{e(title)}</dc:title>'
-            '<upnp:class>object.item.videoItem</upnp:class>'
-            f'<res protocolInfo="http-get:*:{mime}:{DLNA_FEATURES}" size="{size}"{res_extra}>{e(url)}</res>'
-            f'{sub_caption}</item></DIDL-Lite>'
-        )
-        self.soap("AVTransport", "SetAVTransportURI",
-                  [("InstanceID", 0), ("CurrentURI", url), ("CurrentURIMetaData", didl)])
+    def set_media(self, url, title, mime, size, sub_url=None, kind="video", features=DLNA_FEATURES, meta=None):
+        self.soap("AVTransport", "SetAVTransportURI", [
+            ("InstanceID", 0), ("CurrentURI", url),
+            ("CurrentURIMetaData", didl(url, title, mime, size, kind, features, sub_url, meta))])
 
     def play(self):
         self.soap("AVTransport", "Play", [("InstanceID", 0), ("Speed", 1)])
@@ -264,7 +407,13 @@ class TV:
     def seek(self, seconds):
         s = max(0, int(seconds))
         target = f"{s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}"
-        self.soap("AVTransport", "Seek", [("InstanceID", 0), ("Unit", "REL_TIME"), ("Target", target)])
+        try:
+            self.soap("AVTransport", "Seek", [("InstanceID", 0), ("Unit", "REL_TIME"), ("Target", target)])
+        except TVError as e:
+            if e.code is None:  # no answer at all: trying the other way won't help
+                raise
+            # some renderers only take ABS_TIME (the same thing for a single file)
+            self.soap("AVTransport", "Seek", [("InstanceID", 0), ("Unit", "ABS_TIME"), ("Target", target)])
 
     def state(self):
         """PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING or NO_MEDIA_PRESENT."""
@@ -363,8 +512,40 @@ def discover(timeout=3.0):
     return _load_tvs(_ssdp(RENDERER, timeout))
 
 
+# where common renderers describe themselves, for a TV that doesn't answer searches
+KNOWN_DESCRIPTIONS = ("http://{h}:9197/dmr",  # Samsung
+                      "http://{h}:52323/dmr.xml",  # Sony
+                      "http://{h}:1400/xml/device_description.xml")  # Sonos
+
+
+def _ssdp_unicast(host, timeout=2.0):
+    """Ask one device directly (UPnP 1.1 unicast M-SEARCH) - finds a renderer at a typed address
+    whatever its brand. Returns LOCATION URLs."""
+    msg = (f"M-SEARCH * HTTP/1.1\r\nHOST: {host}:1900\r\nMAN: \"ssdp:discover\"\r\n"
+           f"ST: {RENDERER}\r\n\r\n").encode()
+    found = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.3)
+            s.sendto(msg, (host, 1900))
+            end = time.time() + timeout
+            while time.time() < end and not found:
+                try:
+                    data, addr = s.recvfrom(65507)
+                except socket.timeout:
+                    s.sendto(msg, (host, 1900))
+                    continue
+                m = re.search(r"^location:\s*(\S+)", data.decode(errors="ignore"), re.I | re.M)
+                if m and addr[0] == host:
+                    found.append(m.group(1))
+    except OSError:
+        pass
+    return found
+
+
 def find_tv(location=None, host=None, timeout=3.0):
-    """Remembered location first (fast), then SSDP, then the Samsung default port."""
+    """Remembered location first (fast), then SSDP; for a typed address also ask the device itself
+    and try where common brands put their description."""
     if location:
         try:
             tv = TV.from_location(location, timeout=2.5)
@@ -376,10 +557,11 @@ def find_tv(location=None, host=None, timeout=3.0):
     if tvs:
         return tvs[0]
     if host:
-        try:
-            return TV.from_location(f"http://{host}:9197/dmr", timeout=2.5)
-        except (TVError,) + DESC_ERRORS:
-            pass
+        for loc in _ssdp_unicast(host) + [u.format(h=host) for u in KNOWN_DESCRIPTIONS]:
+            try:
+                return TV.from_location(loc, timeout=2.5)
+            except (TVError,) + DESC_ERRORS:
+                pass
     return None
 
 
@@ -387,7 +569,7 @@ def find_tv(location=None, host=None, timeout=3.0):
 
 OUI_FILES = ("/usr/share/hwdata/oui.txt", "/usr/share/ieee-data/oui.txt",
              "/var/lib/ieee-data/oui.txt", "/usr/share/misc/oui.txt")
-TV_BRANDS = ("samsung", "lg electronics", "sony", "hisense", "tcl", "philips", "panasonic", "vizio",
+TV_BRANDS = ("samsung", "lg electronics", "sony", "hisense", "tcl", "philips", "tp vision", "panasonic", "vizio",
              "xiaomi", "sharp", "toshiba", "roku", "skyworth", "grundig", "vestel", "funai")
 KIND_ORDER = {"tv": 0, "speaker": 1, "router": 2, "upnp": 3, "unknown": 4, "pc": 5}
 
@@ -481,6 +663,11 @@ def _reverse_dns(hosts, timeout):
     return dict(names)
 
 
+def PHILIPS_HINT():  # noqa: N802 - a translated constant
+    return _("Philips TV: turn on Digital Media Renderer - DMR (All Settings > Wireless and Networks > "
+             "Wired or Wi-Fi), then scan again")
+
+
 def scan_network(timeout=3.0):
     """Every device we can see on the LAN, with whether it can play video.
 
@@ -521,7 +708,7 @@ def scan_network(timeout=3.0):
             video = tv.plays_video()
             dev.update(tv=tv, name=tv.name, detail=" ".join(x for x in (tv.manufacturer, tv.model) if x))
             if video is False:
-                dev.update(kind="speaker", note=_("Audio only - can't show video"))
+                dev.update(kind="speaker", can_play=True, note=_("Plays music only"))
             else:
                 dev.update(kind="tv", can_play=True, note=_("Can play video"))
         elif h == gateway or any("InternetGatewayDevice" in t for d in mine for t in d["types"]):
@@ -531,11 +718,23 @@ def scan_network(timeout=3.0):
         elif mine:
             d = next((d for d in mine if d["name"]), mine[0])
             server = any("MediaServer" in t for t in d["types"])
-            dev.update(kind="upnp", name=d["name"] or dev["name"],
-                       note=_("Media server / NAS - can't play video") if server else _("Network device - can't play video"),
+            brand = " ".join([vendor or ""] + [x["manufacturer"] for x in mine]).lower()
+            note = _("Media server / NAS - can't play video") if server else _("Network device - can't play video")
+            if not server and ("philips" in brand or "tp vision" in brand):
+                note = PHILIPS_HINT()
+            elif not server and any("dial" in t.lower() for x in mine for t in x["types"]):
+                note = _("Smart TV with its media player (DLNA) off - look for DLNA, media sharing or "
+                         "DMR in its network settings")
+            dev.update(kind="upnp", name=d["name"] or dev["name"], note=note,
                        detail=" ".join(x for x in (d["manufacturer"], d["model"]) if x))
         else:
-            if vendor and any(b in vendor.lower() for b in TV_BRANDS):
+            v = (vendor or "").lower()
+            if "philips" in v or "tp vision" in v:
+                dev["note"] = PHILIPS_HINT()
+            elif "google" in v or "nvidia" in v:
+                dev["note"] = _("Google Cast device (Chromecast, Google TV, Shield) - it doesn't take DLNA, "
+                                "which OpusCast uses")
+            elif vendor and any(b in v for b in TV_BRANDS):
                 dev["note"] = _("No casting support found - if this is a TV, turn it on and scan again")
             elif private:
                 dev["note"] = _("Private Wi-Fi address (probably a phone or laptop) - can't play video")
@@ -772,11 +971,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve(self, send_body):
         media = self.server.media
         path = urllib.parse.urlsplit(self.path).path
-        if media and path in media["subs"]:
-            data = media["subs"][path]
+        if media and (path in media["subs"] or path in media["extras"]):
+            mime, data = ("text/srt; charset=utf-8", media["subs"][path]) if path in media["subs"] \
+                else media["extras"][path]
             self.send_response(200)
-            self.send_header("Content-Type", "text/srt; charset=utf-8")
+            self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("transferMode.dlna.org", "Interactive")
             self.end_headers()
             if send_body:
                 self.wfile.write(data)
@@ -785,6 +986,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         media["requested"].set()
+        mime = media.get("tv_mime") or media["mime"]
+        # the TV may ask for a transfer mode (Sony does); answer in kind
+        transfer = self.headers.get("transferMode.dlna.org") or media["transfer"]
+        if media["live"] is not None:
+            self._serve_live(media, mime, transfer, send_body)
+            return
         size = media["size"]
         try:
             rng = _parse_range(self.headers.get("Range"), size)
@@ -796,28 +1003,64 @@ class _Handler(BaseHTTPRequestHandler):
             return
         start, end = rng or (0, size - 1)
         self.send_response(206 if rng else 200)
-        self.send_header("Content-Type", media["mime"])
+        self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
         if rng:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.send_header("transferMode.dlna.org", "Streaming")
-        self.send_header("contentFeatures.dlna.org", DLNA_FEATURES)
+        self.send_header("transferMode.dlna.org", transfer)
+        self.send_header("contentFeatures.dlna.org", media["features"])
         # Samsung TVs ask for these; answering like other DLNA servers do keeps their player happy
         if self.headers.get("getCaptionInfo.sec") and media.get("sub_path"):
             here = self.connection.getsockname()[0]
             self.send_header("CaptionInfo.sec", f"http://{here}:{self.server.server_address[1]}{media['sub_path']}")
-        if self.headers.get("getMediaInfo.sec"):
+        if self.headers.get("getMediaInfo.sec") and media["kind"] != "image":
             ms = _media_duration(media)
             if ms:
                 self.send_header("MediaInfo.sec", f"SEC_Duration={ms};")
         self.end_headers()
-        if send_body:
-            try:
-                with open(media["file"], "rb") as f:
-                    self.connection.sendfile(f, offset=start, count=end - start + 1)
-            except OSError:
-                pass
+        if not send_body:
+            return
+        if media["data"] is not None:
+            self.wfile.write(media["data"][start:end + 1])
+            return
+        try:
+            with open(media["file"], "rb") as f:
+                self.connection.sendfile(f, offset=start, count=end - start + 1)
+        except OSError:
+            pass
+
+    def _serve_live(self, media, mime, transfer, send_body):
+        """A stream with no end and no length: chunked for HTTP/1.1 TVs, until the connection closes for
+        HTTP/1.0 ones. Ranges are ignored - a live stream starts now wherever the TV asks."""
+        chunked = self.request_version == "HTTP/1.1"
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("transferMode.dlna.org", transfer)
+        self.send_header("contentFeatures.dlna.org", media["features"])
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if not send_body:
+            return
+        client = media["live"].open()
+        try:
+            while True:
+                data = client.read(timeout=5.0)
+                if data is None:
+                    continue  # nothing new yet (the encoder waits for the screen to change)
+                if not data:
+                    break  # the stream ended
+                self.wfile.write(b"%X\r\n%s\r\n" % (len(data), data) if chunked else data)
+            if chunked:
+                self.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass  # the TV went away
+        finally:
+            client.close()
 
 
 _duration_lock = threading.Lock()
@@ -826,7 +1069,8 @@ _duration_lock = threading.Lock()
 def _media_duration(media):
     with _duration_lock:
         if "duration_ms" not in media:
-            media["duration_ms"] = _duration_ms(media["file"])
+            known = media["meta"].get("duration")
+            media["duration_ms"] = int(known * 1000) if known else _duration_ms(media["file"]) if media["file"] else None
         return media["duration_ms"]
 
 
@@ -863,25 +1107,48 @@ class MediaServer:
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
-    def publish(self, path, subtitle=None):
-        """Serve a video, optionally with a subtitle (SRT bytes) announced to the TV with it."""
-        ext = os.path.splitext(path)[1].lower()
+    def publish(self, path=None, subtitle=None, *, kind=None, data=None, mime=None, title=None, live=None,
+                features=None, meta=None):
+        """Serve one thing to the TV: a file, bytes (a converted photo) or a live stream (the desktop).
+        A video can come with a subtitle (SRT bytes) announced to the TV with it."""
         token = secrets.token_hex(4)
+        if live is not None:
+            kind, mime, size, ext = kind or "video", mime or "video/mpeg", None, ".ts"
+            features = features or LIVE_FEATURES
+        else:
+            kind = kind or media_kind(path or "") or "video"
+            mime = mime or mime_of(path or "", kind)
+            size = len(data) if data is not None else os.path.getsize(path)
+            ext = os.path.splitext(path or "")[1].lower()
+            if data is not None or kind != "video":
+                ext = {"image/jpeg": ".jpg", "image/png": ".png", "audio/mpeg": ".mp3"}.get(mime, ext or ".bin")
+            elif ext not in MIME:
+                ext = ".mp4"
         media = {
-            "file": path, "size": os.path.getsize(path), "mime": MIME.get(ext, "video/mp4"),
-            "title": os.path.splitext(os.path.basename(path))[0], "token": token,
-            "url_path": f"/media/{token}{ext if ext in MIME else '.mp4'}",
-            "sub_path": None, "blank_path": f"/media/{token}-off.srt", "subs": {},
+            "file": path, "data": data, "live": live, "size": size, "mime": mime, "kind": kind,
+            "features": features or DLNA_FEATURES, "transfer": "Interactive" if kind == "image" else "Streaming",
+            "title": title or os.path.splitext(os.path.basename(path or ""))[0] or APP_NAME, "token": token,
+            "url_path": f"/media/{token}{ext}", "meta": dict(meta or {}),
+            "sub_path": None, "blank_path": f"/media/{token}-off.srt", "subs": {}, "extras": {},
             "requested": threading.Event(),
             # subtitle commands: a counter so a pending resend knows it's out of date, when the last went out
             "caption_lock": threading.Lock(), "caption_seq": 0, "caption_sent": 0.0,
         }
+        if kind == "audio" and mime == "audio/mpeg":
+            media["features"] = "DLNA.ORG_PN=MP3;" + media["features"]
         media["subs"][media["blank_path"]] = BLANK_SRT
         if subtitle is not None:
             media["sub_path"] = f"/media/{token}.srt"
             media["subs"][media["sub_path"]] = subtitle
         self.httpd.media = media
         return media
+
+    def add_extra(self, media, mime, data):
+        """Serve a file that goes with the media (a song's cover); returns its URL path."""
+        ext = {"image/jpeg": ".jpg", "image/png": ".png"}.get(mime, ".bin")
+        path = f"/media/{media['token']}-{secrets.token_hex(3)}{ext}"
+        media["extras"][path] = (mime, data)
+        return path
 
     def add_subtitle(self, media, data):
         """Serve one more subtitle file for the playing video; returns its URL path."""
@@ -904,6 +1171,183 @@ class MediaServer:
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+class LiveStream:
+    """One live MPEG-TS stream (the desktop) shared by every request for it.
+
+    TVs often open the URL twice (a quick look, then for real) and reconnect after buffering, but there is
+    only one encoder. Each request starts at the latest keyframe, right after the stream's PAT and PMT, so
+    the TV's decoder can start at once; a request that falls far behind (the TV paused) skips ahead to the
+    next keyframe instead of piling up old pictures."""
+
+    BACKLOG = 8 << 20  # bytes a slow request may lag behind before it skips ahead
+    GOP_LIMIT = 24 << 20
+
+    def __init__(self, on_join=None):
+        self.cond = threading.Condition()
+        self.clients = []
+        self.closed = False
+        self.error = None
+        self.on_join = on_join  # e.g. ask the encoder for a keyframe
+        self._rest = b""
+        self.pat = self.pmt = None
+        self.pmt_pid = self.video_pid = self.video_type = None
+        self.gop, self.gop_bytes = [], 0  # packets since the latest keyframe
+        self.keyframes = 0
+        self.bytes_in = 0
+
+    def feed(self, data):
+        """Encoder output, in any amount (partial packets wait for the rest)."""
+        data = self._rest + data
+        packets, pos, n = [], 0, len(data)
+        while pos + 188 <= n:
+            if data[pos] != 0x47:  # lost sync: find the next packet start
+                nxt = data.find(b"\x47", pos + 1)
+                if nxt < 0:
+                    pos = n
+                    break
+                pos = nxt
+                continue
+            packets.append(data[pos:pos + 188])
+            pos += 188
+        self._rest = data[pos:]
+        if not packets:
+            return
+        with self.cond:
+            self.bytes_in += len(packets) * 188
+            for p in packets:
+                self._packet(p)
+            self.cond.notify_all()
+
+    def _packet(self, p):
+        pid = ((p[1] & 0x1F) << 8) | p[2]
+        start = bool(p[1] & 0x40)
+        afc = (p[3] >> 4) & 3
+        payload_at, rai = 4, False
+        if afc & 2:
+            if p[4] > 0:
+                rai = bool(p[5] & 0x40)
+            payload_at = 5 + p[4]
+        payload = p[payload_at:] if afc & 1 else b""
+        if pid == 0 and start and payload:
+            self._parse_pat(payload)
+            self.pat = p
+        elif pid == self.pmt_pid and start and payload:
+            self._parse_pmt(payload)
+            self.pmt = p
+        key = pid == self.video_pid and start and (rai or _starts_keyframe(payload, self.video_type))
+        if key and self.pat and self.pmt:
+            self.keyframes += 1
+            self.gop, self.gop_bytes = [p], 188
+        elif self.gop and self.gop_bytes < self.GOP_LIMIT:
+            self.gop.append(p)
+            self.gop_bytes += 188
+        for c in self.clients:
+            if c.waiting:
+                if key and self.pat and self.pmt:
+                    c.buf += self.pat + self.pmt + p
+                    c.waiting = False
+            else:
+                c.buf += p
+                if len(c.buf) > self.BACKLOG:
+                    c.buf.clear()
+                    c.waiting = True
+
+    def _parse_pat(self, payload):
+        sec = payload[1 + payload[0]:]
+        length = ((sec[1] & 0x0F) << 8) | sec[2] if len(sec) >= 3 else 0
+        for i in range(8, min(3 + length - 4, len(sec) - 3), 4):
+            program, pid = (sec[i] << 8) | sec[i + 1], ((sec[i + 2] & 0x1F) << 8) | sec[i + 3]
+            if program != 0:
+                self.pmt_pid = pid
+                return
+
+    def _parse_pmt(self, payload):
+        sec = payload[1 + payload[0]:]
+        if len(sec) < 12:
+            return
+        length = ((sec[1] & 0x0F) << 8) | sec[2]
+        i, end = 12 + (((sec[10] & 0x0F) << 8) | sec[11]), min(3 + length - 4, len(sec))
+        while i + 5 <= end:
+            stype, pid = sec[i], ((sec[i + 1] & 0x1F) << 8) | sec[i + 2]
+            if stype in (0x01, 0x02, 0x10, 0x1B, 0x24):  # MPEG-1/2, MPEG-4, H.264, H.265 video
+                self.video_pid, self.video_type = pid, stype
+                return
+            i += 5 + (((sec[i + 3] & 0x0F) << 8) | sec[i + 4])
+
+    def open(self):
+        """A reader for one HTTP request: it starts at the latest keyframe."""
+        c = _LiveClient(self)
+        with self.cond:
+            if self.gop and self.pat and self.pmt:
+                c.buf += self.pat + self.pmt + b"".join(self.gop)
+                c.waiting = False
+            self.clients.append(c)
+        if self.on_join:
+            try:
+                self.on_join()
+            except Exception:  # noqa: BLE001
+                pass
+        return c
+
+    def wait_started(self, timeout):
+        """True once the stream has its first keyframe (the TV can be told to play it)."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while not (self.keyframes or self.closed):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.cond.wait(left)
+            return self.keyframes > 0
+
+    def close(self, error=None):
+        with self.cond:
+            if not self.closed:
+                self.closed, self.error = True, error
+            self.cond.notify_all()
+
+
+class _LiveClient:
+    def __init__(self, stream):
+        self.stream, self.buf, self.waiting = stream, bytearray(), True
+
+    def read(self, timeout=5.0, most=256 << 10):
+        """Bytes to send; None if nothing came within timeout; b"" when the stream has ended."""
+        cond = self.stream.cond
+        with cond:
+            if not self.buf and not self.stream.closed:
+                cond.wait(timeout)
+            if self.buf:
+                data = bytes(self.buf[:most])
+                del self.buf[:most]
+                return data
+            return b"" if self.stream.closed else None
+
+    def close(self):
+        with self.stream.cond:
+            if self in self.stream.clients:
+                self.stream.clients.remove(self)
+
+
+def _starts_keyframe(pes, stream_type):
+    """Does this PES packet start a picture a decoder can begin with (H.264/H.265 parameter sets or IDR,
+    MPEG-2 sequence header)? Only needed when the muxer doesn't flag keyframes itself."""
+    if pes[:3] != b"\x00\x00\x01" or len(pes) < 9:
+        return False
+    es = pes[9 + pes[8]:]
+    i = es.find(b"\x00\x00\x01")
+    while 0 <= i < len(es) - 3:
+        code = es[i + 3]
+        if stream_type == 0x1B and not code & 0x80 and code & 0x1F in (5, 7):
+            return True
+        if stream_type == 0x24 and (code >> 1) & 0x3F in (19, 20, 32, 33):
+            return True
+        if stream_type in (0x01, 0x02) and code == 0xB3:
+            return True
+        i = es.find(b"\x00\x00\x01", i + 3)
+    return False
 
 
 def show_subtitle(tv, server, media, path=None):
@@ -967,17 +1411,42 @@ def _reshow_when_playing(tv, server, media, seq, start_at, seen):
                 return
 
 
+def play(tv, tries=5):
+    """Play, allowing for TVs that are still busy taking the new URL (UPnP error 701, "transition not
+    available" - Sony, Philips and others) and for those that start by themselves."""
+    for attempt in range(tries):
+        try:
+            tv.play()
+            return
+        except TVError as e:
+            if e.code != 701 or attempt == tries - 1:
+                raise
+            try:
+                if tv.state() in ("PLAYING", "TRANSITIONING"):
+                    return
+            except TVError:
+                pass
+            time.sleep(0.7)
+
+
 def play_media(tv, server, media, start_at=0, wait=20.0, subs_on=False):
     """Hand published media to the TV and start it, optionally resuming at start_at seconds
     and switching its subtitle on. Returns the show_subtitle() result, or None without subtitles."""
+    media["tv_mime"] = mime = tv.pick_mime(media["mime"])
     url = server.url(media, tv.host)
-    sub = server.sub_url(media, tv.host)
+    sub = server.sub_url(media, tv.host) if media["kind"] == "video" else None
+    meta = dict(media["meta"])
+    if meta.get("cover_path"):
+        meta["cover_url"] = server.url_for(tv.host, meta["cover_path"])
     try:
         tv.stop()
     except TVError:
         pass  # nothing was playing
-    tv.set_media(url, media["title"], media["mime"], media["size"], sub_url=sub)
-    tv.play()
+    tv.set_media(url, media["title"], mime, media["size"], sub_url=sub, kind=media["kind"],
+                 features=media["features"], meta=meta)
+    play(tv)
+    if media["kind"] == "image" or media["live"] is not None:
+        return None
     playing = False
     if (start_at and start_at > 1) or (sub and subs_on):
         deadline = time.time() + wait
@@ -1043,22 +1512,30 @@ PACKAGES = {  # what to install, per distro family
         "gst": "gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base",
         "gst-good": "gstreamer1.0-plugins-good", "gst-gtk": "gstreamer1.0-gtk3 gstreamer1.0-gl",
         "gst-libav": "gstreamer1.0-libav", "gst-va": "gstreamer1.0-plugins-bad",
-        "intro": "python3-cairo ffmpeg", "subs": "ffmpeg"}),
+        "intro": "python3-cairo ffmpeg", "subs": "ffmpeg", "desktop": "ffmpeg",
+        "desktop-wayland": "python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-pipewire",
+        "photos": "heif-gdk-pixbuf webp-pixbuf-loader"}),
     "arch": ("sudo pacman -S --needed", {
         "gtk": "python-gobject gtk3", "gst": "gstreamer gst-plugins-base",
         "gst-good": "gst-plugins-good", "gst-gtk": "gst-plugin-gtk",
-        "gst-libav": "gst-libav", "gst-va": "gst-plugin-va", "intro": "python-cairo ffmpeg", "subs": "ffmpeg"}),
+        "gst-libav": "gst-libav", "gst-va": "gst-plugin-va", "intro": "python-cairo ffmpeg", "subs": "ffmpeg",
+        "desktop": "ffmpeg", "desktop-wayland": "python-gobject gstreamer gst-plugins-base gst-plugin-pipewire",
+        "photos": "libheif webp-pixbuf-loader"}),
     "fedora": ("sudo dnf install", {
         "gtk": "python3-gobject gtk3", "gst": "gstreamer1 gstreamer1-plugins-base",
         "gst-good": "gstreamer1-plugins-good", "gst-gtk": "gstreamer1-plugins-good-gtk",
         "gst-libav": "gstreamer1-plugin-libav", "gst-va": "gstreamer1-plugins-bad-free",
-        "intro": "python3-cairo ffmpeg-free", "subs": "ffmpeg-free"}),
+        "intro": "python3-cairo ffmpeg-free", "subs": "ffmpeg-free", "desktop": "ffmpeg-free",
+        "desktop-wayland": "python3-gobject gstreamer1 gstreamer1-plugins-base pipewire-gstreamer",
+        "photos": "webp-pixbuf-loader"}),
 }
 GENERIC = {
     "gtk": "PyGObject + GTK 3", "gst": "GStreamer 1.x (Python bindings, base plugins)",
     "gst-good": "GStreamer good plugins", "gst-gtk": "GStreamer GTK plugin (gtksink)",
     "gst-libav": "GStreamer libav plugin", "gst-va": "GStreamer VA-API plugin",
-    "intro": "pycairo + ffmpeg", "subs": "ffmpeg",
+    "intro": "pycairo + ffmpeg", "subs": "ffmpeg", "desktop": "ffmpeg",
+    "desktop-wayland": "PyGObject + GStreamer with its PipeWire plugin",
+    "photos": "GdkPixbuf loaders for HEIC (libheif) and WebP (webp-pixbuf-loader)",
 }
 
 
@@ -1131,6 +1608,10 @@ if __name__ == "__main__" and "--check-deps" in sys.argv:
     if not gui:
         line(not preview, _("Show on PC"), preview)
     line(not subs, _("Built-in subtitle tracks"), subs)
+    import opuscast_desktop
+    desk = opuscast_desktop.missing()
+    line(not desk, _("Cast the desktop"), desk)
+    line(not subs, _("Music the TV doesn't play, converted to MP3"), subs)
     line(not intro, _("Skynet intro"), intro)
     if rec:
         print(f"  • {_('Recommended for a smooth 4K preview')}: {GENERIC[rec[0]]}\n      {install_hint(rec)}")

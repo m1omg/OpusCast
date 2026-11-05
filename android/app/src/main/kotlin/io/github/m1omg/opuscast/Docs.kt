@@ -7,17 +7,22 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import io.github.m1omg.opuscast.core.MediaKind
 import io.github.m1omg.opuscast.core.MediaSource
 import io.github.m1omg.opuscast.core.RandomAccessSource
+import io.github.m1omg.opuscast.core.kindOf
+import io.github.m1omg.opuscast.core.mimeFor
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.nio.ByteBuffer
 
-/** A video the user picked: a content:// document (or, rarely, a file:// path). */
-data class Video(val ref: String, val name: String, val size: Long) {
+/** A video, song or photo the user picked: a content:// document (or, rarely, a file:// path). [mime] is
+ *  what the system says it is, for names without a telling extension. */
+data class Video(val ref: String, val name: String, val size: Long, val mime: String? = null) {
     val uri: Uri get() = Uri.parse(ref)
+    val kind: MediaKind? get() = kindOf(name, mime)
 }
 
 /** Reading the user's files through Android's content providers. */
@@ -44,7 +49,8 @@ object Docs {
             context.contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
         }
         if (size < 0) throw IOException("unknown size")
-        return Video(uri.toString(), name ?: uri.lastPathSegment?.substringAfterLast('/') ?: "video", size)
+        val type = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+        return Video(uri.toString(), name ?: uri.lastPathSegment?.substringAfterLast('/') ?: "video", size, type)
     }
 
     fun displayName(context: Context, ref: String): String? {
@@ -124,6 +130,8 @@ class PfdRandomAccess(private val pfd: ParcelFileDescriptor) : RandomAccessSourc
 class DocSource(private val context: Context, private val video: Video) : MediaSource {
     override val name = video.name
     override val size = video.size
+    override val mime: String = mimeFor(video.name, video.mime)
+    override val kind: MediaKind = video.kind ?: MediaKind.VIDEO
     override val durationMs: Long? get() = Docs.durationMs(context, video.ref)
 
     override fun openAt(offset: Long): InputStream {

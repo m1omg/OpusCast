@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""opuscast - play a video from this PC on your TV (command-line OpusCast).
+"""opuscast - play videos, music and photos from this PC on your TV, or show it the desktop
+(command-line OpusCast).
 
   opuscast VIDEO                  play it on the TV (Ctrl+C stops)
   opuscast VIDEO --from 1:02:30   start part-way through
   opuscast VIDEO --sub auto       with subtitles (auto, a file, or a track number from --subs)
   opuscast VIDEO --subs           list the subtitles found for the video
   opuscast VIDEO --intro          Skynet boot intro first
+  opuscast SONG... | FOLDER       play songs one after another
+  opuscast PHOTO... --every 8     slideshow, a new photo every 8 seconds (one photo stays up)
+  opuscast --desktop              show this PC's screen and sound on the TV (--size 720, --fps 60,
+                                  --screen 2, --no-sound)
   opuscast --list                 show devices on the network and which can play video
   opuscast --stop                 stop whatever the TV is playing
 """
 import argparse
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import opuscast_core as core  # noqa: E402
+import opuscast_media as media  # noqa: E402
 from opuscast_i18n import _  # noqa: E402
 
 
@@ -24,33 +31,37 @@ def states():
             "TRANSITIONING": _("loading"), "NO_MEDIA_PRESENT": _("idle"), "UNREACHABLE": _("not responding")}
 
 
-def start(tv, server, path, start_at=0, subtitle=None):
-    """Publish and start a video. If the start commands fail, the TV may still play it (a Samsung asks
-    "Allow this device?" the first time and carries the commands out once allowed): say so and go on."""
-    media = server.publish(os.path.abspath(path), subtitle)
+def start(tv, server, path, start_at=0, subtitle=None, media_obj=None):
+    """Publish and start a video (or start already published media). If the start commands fail, the
+    TV may still play it (a Samsung asks "Allow this device?" the first time and carries the commands
+    out once allowed): say so and go on."""
+    item = media_obj or server.publish(os.path.abspath(path), subtitle)
     try:
-        media["captions"] = core.play_media(tv, server, media, start_at, subs_on=subtitle is not None)
-        media["start_error"] = None
+        item["captions"] = core.play_media(tv, server, item, start_at, subs_on=subtitle is not None)
+        item["start_error"] = None
     except core.TVError as e:
-        media["start_error"] = e
-        print(_("The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
-                "choose Allow - the video then starts by itself.").format(error=e))
-    media["start_at"], media["subtitle"] = start_at, subtitle
-    return media
+        item["start_error"] = e
+        print(_("The TV hasn't taken it yet ({error}). If the TV asks whether to allow this PC, choose Allow - "
+                "it then starts by itself.").format(error=e))
+    item["start_at"], item["subtitle"] = start_at, subtitle
+    return item
 
 
-def wait_until_done(tv, server, media):
-    """Follow the TV until the video ends. Returns False if it never started."""
+def wait_until_done(tv, server, item, quiet=False):
+    """Follow the TV until it's done. Returns None if it never started, else True when it played to
+    the end and False when it was stopped half-way (or something else is on the TV now)."""
     seen, last, start_time, warned = False, None, time.time(), False
-    answering, retried = None, False
+    answering, retried, pos, dur = None, False, 0, 0
     names = states()
     while True:
         time.sleep(1)
-        if media.get("start_error") is not None and not seen and time.time() - start_time > 120:
-            print(_("Couldn't start the video on the TV: {error}").format(error=media["start_error"]))
-            return False
-        if (not media["requested"].is_set() and not warned and time.time() - start_time > 15
-                and media.get("start_error") is None):
+        if item.get("start_error") is not None and not seen and time.time() - start_time > 120:
+            print(_("Couldn't start it on the TV: {error}").format(error=item["start_error"]))
+            return None
+        if item["live"] is not None and item["live"].closed:
+            return False  # the desktop capture stopped
+        if (not item["requested"].is_set() and not warned and time.time() - start_time > 15
+                and item.get("start_error") is None):
             warned = True
             print(_("The TV hasn't loaded the video yet - a firewall on this PC may be blocking it.") + "\n"
                   f"  ufw:       sudo ufw allow from {tv.host} to any port {server.port} proto tcp\n"
@@ -58,31 +69,36 @@ def wait_until_done(tv, server, media):
                   f"source address={tv.host} port port={server.port} protocol=tcp accept' && sudo firewall-cmd --reload")
         try:
             state = tv.state()
-            uri = tv.position()[2]
+            now_pos, now_dur, uri = tv.position()
             answering = answering or time.time()
         except core.TVError:
-            state, uri, answering = "UNREACHABLE", None, None
-        ours = not uri or media["url_path"] in uri
-        if media.get("start_error") is not None and not seen and not retried and answering \
+            state, uri, answering, now_pos, now_dur = "UNREACHABLE", None, None, None, None
+        ours = not uri or item["url_path"] in uri
+        if ours and state == "PLAYING":
+            pos, dur = now_pos if now_pos is not None else pos, now_dur or dur
+        if item.get("start_error") is not None and not seen and not retried and answering \
                 and time.time() - answering >= 4 and not (state == "PLAYING" and ours):
             retried = True  # the TV answers again but didn't start it by itself: send it once more
             try:
-                media["captions"] = core.play_media(tv, server, media, media["start_at"],
-                                                    subs_on=media["subtitle"] is not None)
+                item["captions"] = core.play_media(tv, server, item, item["start_at"],
+                                                    subs_on=item["subtitle"] is not None)
             except core.TVError:
                 pass
-        if state != last:
+        if state != last and not quiet:
             print(_("TV:"), names.get(state, state.lower()))
-            last = state
+        last = state
         if state == "PLAYING" and ours:
-            if not seen and media.get("start_error") is not None and media["start_at"] > 1:
+            if not seen and item.get("start_error") is not None and item["start_at"] > 1:
                 try:  # the resume point was never sent
-                    tv.seek(media["start_at"])
+                    tv.seek(item["start_at"])
                 except core.TVError:
                     pass
             seen = True
-        elif seen and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
-            return True
+        elif seen and item["kind"] != "image" and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
+            length = dur or item["meta"].get("duration") or 0
+            return ours and (not length or pos >= length - 5)
+        elif seen and item["kind"] == "image":
+            return True  # shown: the slideshow decides how long
 
 
 def parse_start(text):
@@ -124,14 +140,125 @@ def pick_subtitle(video, choice):
     sys.exit(_("No such subtitle file: {path}").format(path=choice))
 
 
+def play_songs(tv, server, songs):
+    """One after another; stops when a song is stopped half-way on the TV."""
+    for n, path in enumerate(songs, 1):
+        tags = media.audio_tags(path)
+        play, mime = path, None
+        if media.needs_mp3(tv, core.mime_of(path, "audio")):
+            print(_("Converting {name} to MP3 - the TV doesn't play this format…").format(name=os.path.basename(path)))
+            try:
+                play, mime = media.to_mp3(path), "audio/mpeg"
+            except core.TVError as e:
+                print(_("Can't play {name}: {error}").format(name=os.path.basename(path), error=e))
+                continue
+        meta = {k: tags[k] for k in ("artist", "albumartist", "album", "track", "duration") if tags.get(k)}
+        song = server.publish(play, kind="audio", mime=mime, title=tags.get("title"), meta=meta)
+        cover = media.song_cover(path, tags)
+        if cover:
+            song["meta"]["cover_path"], song["meta"]["cover_mime"] = server.add_extra(song, *cover), cover[0]
+        start(tv, server, play, media_obj=song)
+        line = " · ".join(x for x in (song["title"], media.song_line(tags)) if x)
+        print(f"[{n}/{len(songs)}] {line}")
+        result = wait_until_done(tv, server, song, quiet=True)
+        if result is None:
+            return False
+        if result is False:
+            print(_("Stopped on the TV."))
+            return True
+    return True
+
+
+def show_photos(tv, server, photos, every):
+    """A slideshow, round and round; one photo just stays on the TV."""
+    n = 0
+    while True:
+        path = photos[n % len(photos)]
+        try:
+            prep = media.prepare_photo(path, tv)
+        except OSError as e:
+            print(_("Can't read that photo: {error}").format(error=e))
+            if len(photos) == 1:
+                return False
+            n += 1
+            continue
+        photo = server.publish(path, kind="image", data=prep.get("data"), mime=prep["mime"],
+                               features=prep["features"])
+        start(tv, server, path, media_obj=photo)
+        print(f"[{n % len(photos) + 1}/{len(photos)}] {os.path.basename(path)}")
+        if prep.get("unconverted"):
+            print("  " + _("The TV may not show {name}: this PC can't convert this kind of photo. "
+                           "This helps:").format(name=os.path.basename(path)) + " " + core.install_hint(["photos"]))
+        if len(photos) == 1:
+            print(_("(Ctrl+C takes it off the TV)"))
+            while True:
+                time.sleep(3600)
+        time.sleep(every)
+        n += 1
+
+
+def cast_desktop(tv, server, cfg, a):
+    import opuscast_desktop as desk
+    need = desk.missing()
+    if need:
+        sys.exit(_("Casting the desktop needs a little more software. Install it with:") + "\n  "
+                 + core.install_hint(need))
+    area = None
+    if desk.session_kind() == "x11":
+        screens = desk.x11_screens()
+        if a.screen and not 1 <= a.screen <= len(screens):
+            sys.exit(_("There's no screen {n} - this PC has {count}.").format(n=a.screen, count=len(screens) or 1))
+        pick = screens[a.screen - 1] if a.screen else next((x for x in screens if x[5]), None)
+        if pick:
+            area = pick[1:5]
+    cast = desk.DesktopCast(height=a.size, fps=a.fps, sound=not a.no_sound, area=area,
+                            restore_token=cfg.get("portal_token"))
+    loop = None
+    if desk.session_kind() == "wayland":  # the screen-cast portal answers through a GLib main loop
+        from gi.repository import GLib
+        loop = GLib.MainLoop()
+        threading.Thread(target=loop.run, daemon=True).start()
+        print(_("Choose what to show in the window that opens…"))
+    ended = threading.Event()
+    cast.on_end = lambda msg: (print("\n" + _("Desktop casting stopped: {error}").format(error=msg)), ended.set())
+    ready, result = threading.Event(), []
+    cast.start(lambda err: (result.append(err), ready.set()))
+    ready.wait()
+    if result[0]:
+        sys.exit(_("Couldn't cast the desktop: {error}").format(error=result[0]))
+    if cast.restore_token:
+        cfg["portal_token"] = cast.restore_token
+        core.save_config(cfg)
+    try:
+        live = server.publish(live=cast.live, title=_("Desktop"))
+        start(tv, server, None, media_obj=live)
+        print(_("Showing the desktop on {tv}: {how}").format(tv=tv.name, how=cast.describe()))
+        if cast.want_sound and not cast.sound:
+            print(_("The PC's sound isn't going to the TV: there's no sound server to record it from."))
+        print(_("(keep this open - Ctrl+C stops)"))
+        if wait_until_done(tv, server, live, quiet=True) is None:
+            sys.exit(1)
+    finally:
+        cast.stop()
+        if loop:
+            loop.quit()
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="opuscast", description=_("Play a video from this PC on your TV."))
-    ap.add_argument("file", nargs="?", help=_("video file to play"))
+    ap = argparse.ArgumentParser(prog="opuscast", description=_("Play videos, music and photos from this PC on your "
+                                                                "TV, or show it the desktop."))
+    ap.add_argument("file", nargs="*", help=_("videos, songs, photos or a folder"))
     ap.add_argument("--tv", metavar="IP", help=_("TV address (default: the last TV used, or the first one found)"))
     ap.add_argument("--from", dest="start", metavar="TIME", help=_("start at TIME, e.g. 1:02:30"))
     ap.add_argument("--sub", metavar="WHICH", help=_("subtitles: auto, a subtitle file, or a number from --subs"))
     ap.add_argument("--subs", action="store_true", help=_("list the subtitles found for the video"))
     ap.add_argument("--intro", action="store_true", help=_("play the Skynet boot intro first"))
+    ap.add_argument("--every", type=float, default=5, metavar="SECONDS", help=_("slideshow: seconds per photo"))
+    ap.add_argument("--desktop", action="store_true", help=_("show this PC's screen and sound on the TV"))
+    ap.add_argument("--size", type=int, choices=(720, 1080), default=1080, help=_("desktop: picture size"))
+    ap.add_argument("--fps", type=int, choices=(30, 60), default=30, help=_("desktop: pictures a second"))
+    ap.add_argument("--screen", type=int, metavar="N", help=_("desktop on X11: which screen (default: the main one)"))
+    ap.add_argument("--no-sound", action="store_true", help=_("desktop: without the PC's sound"))
     ap.add_argument("--list", action="store_true", help=_("show devices on the network and which can play video"))
     ap.add_argument("--stop", action="store_true", help=_("stop playback on the TV and exit"))
     a = ap.parse_args()
@@ -139,11 +266,18 @@ def main():
     if a.list:
         list_devices()
         return
-    if not a.file and not a.stop:
-        ap.error(_("give a video file (or --list / --stop)"))
-    if a.file and not os.path.isfile(a.file):
-        sys.exit(_("No such file: {path}").format(path=a.file))
+    if not a.file and not a.stop and not a.desktop:
+        ap.error(_("give a video, songs or photos (or --desktop / --list / --stop)"))
+    for path in a.file:
+        if not os.path.exists(path):
+            sys.exit(_("No such file: {path}").format(path=path))
+    kind, files = media.collect(a.file)
+    if a.file and kind is None:
+        sys.exit(_("That doesn't look like a video, song or photo."))
+    a.file = files[0] if kind == "video" else None
     if a.subs:
+        if not a.file:
+            sys.exit(_("--subs is for videos"))
         entries = core.list_subtitles(os.path.abspath(a.file))
         if not entries:
             print(_("No subtitles found next to this video or inside it."))
@@ -172,18 +306,40 @@ def main():
         tv.stop()
         print(_("Stopped."))
         return
+    speaker = tv.plays_video() is False
+    if speaker and (a.desktop or kind in ("video", "image")):
+        sys.exit(_("{device} plays music only - choose a TV for videos, photos and the desktop.").format(
+            device=tv.name))
 
     server = core.MediaServer()
     try:
+        if a.desktop:
+            cast_desktop(tv, server, cfg, a)
+            print(_("Finished."))
+            return
+        if kind == "audio":
+            if not play_songs(tv, server, files):
+                sys.exit(1)
+            print(_("Finished."))
+            return
+        if kind == "image":
+            if not show_photos(tv, server, files, max(1.0, a.every)):
+                sys.exit(1)
+            return
         if a.intro:
             import opuscast_intro
             print(_("Skynet is booting…"))
             wait_until_done(tv, server, start(tv, server, opuscast_intro.ensure_intro()))
-        media = start(tv, server, a.file, start_at, subtitle=subtitle)
-        print(_("Playing on {tv}: {title}").format(tv=tv.name, title=media["title"]))
-        print(_("(keep this open while you watch - Ctrl+C stops)"))
-        if not wait_until_done(tv, server, media):
-            sys.exit(1)
+        for n, video in enumerate(files):
+            item = start(tv, server, video, start_at if n == 0 else 0, subtitle=subtitle if n == 0 else None)
+            print(_("Playing on {tv}: {title}").format(tv=tv.name, title=item["title"]))
+            if n == 0:
+                print(_("(keep this open while you watch - Ctrl+C stops)"))
+            result = wait_until_done(tv, server, item)
+            if result is None:
+                sys.exit(1)
+            if result is False:
+                break  # stopped on the TV
         print(_("Finished."))
     except KeyboardInterrupt:
         try:

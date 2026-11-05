@@ -29,7 +29,8 @@ command -v python3 >/dev/null || { echo "OpusCast needs Python 3 - install it wi
 
 mkdir -p "$APPDIR" "$BIN" "$(dirname "$DESKTOP")" "$(dirname "$ICON")"
 rm -rf "$APPDIR/__pycache__"
-install -m 644 "$SRC/opuscast_core.py" "$SRC/opuscast_intro.py" "$SRC/opuscast_i18n.py" "$APPDIR/"
+install -m 644 "$SRC/opuscast_core.py" "$SRC/opuscast_media.py" "$SRC/opuscast_desktop.py" \
+  "$SRC/opuscast_intro.py" "$SRC/opuscast_i18n.py" "$APPDIR/"
 install -m 755 "$SRC/opuscast" "$SRC/opuscast-gui" "$APPDIR/"
 install -m 644 "$SRC/data/$APP_ID.svg" "$ICON"
 ln -sf "$APPDIR/opuscast" "$BIN/opuscast"
@@ -41,21 +42,21 @@ Type=Application
 Name=OpusCast
 GenericName=Play on TV
 GenericName[sk]=Prehrať v televízore
-Comment=Play videos from this PC on your smart TV
-Comment[sk]=Prehráva videá z tohto počítača v televízore
+Comment=Play videos, music and photos from this PC on your smart TV, or show it the desktop
+Comment[sk]=Prehráva videá, hudbu a fotky z tohto počítača v televízore alebo mu ukáže plochu
 Exec="$APPDIR/opuscast-gui" %F
 Icon=$APP_ID
 Terminal=false
-Categories=AudioVideo;Video;Player;
-MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/vnd.avi;video/mpeg;video/mp2t;video/x-flv;video/x-ms-wmv;video/3gpp;video/x-m4v;
-Keywords=tv;cast;dlna;upnp;stream;samsung;lg;
+Categories=AudioVideo;Video;Audio;Player;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/vnd.avi;video/mpeg;video/mp2t;video/x-flv;video/x-ms-wmv;video/3gpp;video/x-m4v;audio/mpeg;audio/flac;audio/x-flac;audio/mp4;audio/x-m4a;audio/ogg;audio/x-vorbis+ogg;audio/x-opus+ogg;audio/opus;audio/x-wav;audio/wav;audio/x-ms-wma;audio/x-aiff;image/jpeg;image/png;image/webp;image/heif;image/heic;image/avif;image/gif;image/bmp;image/tiff;
+Keywords=tv;cast;dlna;upnp;stream;samsung;lg;philips;sony;music;photos;slideshow;desktop;screen;mirror;
 StartupNotify=true
 StartupWMClass=opuscast
 EOF
 refresh
 
 echo "OpusCast installed:"
-echo "  • App menu: OpusCast - and right-click a video → Open With → OpusCast"
+echo "  • App menu: OpusCast - and right-click a video, song or photo → Open With → OpusCast"
 echo "  • Terminal: opuscast-gui, or opuscast VIDEO (opuscast --help)"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "  (add $BIN to your PATH for the terminal commands)";; esac
 echo

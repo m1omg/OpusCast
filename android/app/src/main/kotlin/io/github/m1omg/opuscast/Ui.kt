@@ -1,7 +1,9 @@
 package io.github.m1omg.opuscast
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,6 +31,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeviceUnknown
@@ -39,8 +42,10 @@ import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Forward30
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
@@ -48,6 +53,7 @@ import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Replay30
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Subtitles
@@ -61,6 +67,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -90,8 +97,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -109,7 +120,9 @@ import io.github.m1omg.opuscast.core.fmtTime
 
 /** What the screen asks the activity to do (system pickers, settings screens). */
 interface UiActions {
+    /** Videos, music or photos. */
     fun chooseVideo()
+    fun castScreen()
     fun chooseSubtitleFile()
     fun allowFolder()
     fun allowAllFiles()
@@ -147,7 +160,7 @@ fun OpusCastScreen(engine: Engine, actions: UiActions) {
                         Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
                     }
                     IconButton(onClick = actions::chooseVideo) {
-                        Icon(Icons.Filled.FolderOpen, contentDescription = stringResource(R.string.choose_video))
+                        Icon(Icons.Filled.FolderOpen, contentDescription = stringResource(R.string.choose_media))
                     }
                 },
             )
@@ -215,7 +228,13 @@ private fun PickPage(ui: UiState, engine: Engine, actions: UiActions) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(16.dp))
                     Button(onClick = actions::chooseVideo, modifier = Modifier.widthIn(min = 220.dp).height(48.dp)) {
-                        Text(stringResource(R.string.choose_video))
+                        Text(stringResource(R.string.choose_media), textAlign = TextAlign.Center)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(onClick = actions::castScreen, modifier = Modifier.widthIn(min = 220.dp).height(48.dp)) {
+                        Icon(Icons.Filled.Cast, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.cast_screen))
                     }
                 }
             }
@@ -269,7 +288,7 @@ private fun RecentRow(item: RecentItem, engine: Engine) {
 
 // ---------------------------------------------------------------- player page
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: () -> Unit) {
     val clock by engine.clock.collectAsStateWithLifecycle()
@@ -278,7 +297,9 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally) {
         val player = exo
-        if (ui.previewOn && player != null) {
+        val art = p.art
+        val video = p.mode == PlayerMode.VIDEO || p.mode == PlayerMode.INTRO
+        if (video && ui.previewOn && player != null) {
             Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(Color.Black, RoundedCornerShape(12.dp))) {
                 AndroidView(
                     factory = { ctx -> PlayerView(ctx).apply { useController = false } },
@@ -287,10 +308,42 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
                     modifier = Modifier.fillMaxSize(),
                 )
             }
+        } else if (p.mode == PlayerMode.PHOTO) {
+            // swipe for the next / previous photo, like in a gallery
+            Box(Modifier.fillMaxWidth().aspectRatio(4f / 3f).background(Color.Black, RoundedCornerShape(12.dp))
+                .pointerInput(Unit) {
+                    var total = 0f
+                    val threshold = 64.dp.toPx()
+                    detectHorizontalDragGestures(
+                        onDragStart = { total = 0f },
+                        onDragEnd = {
+                            when {
+                                total < -threshold -> engine.nextPhoto()
+                                total > threshold -> engine.previousPhoto()
+                            }
+                        },
+                    ) { _, dx -> total += dx }
+                }, contentAlignment = Alignment.Center) {
+                if (art != null) {
+                    val image = remember(art) { art.asImageBitmap() }
+                    Image(image, contentDescription = p.title, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+                } else {
+                    Icon(Icons.Filled.Photo, contentDescription = null, modifier = Modifier.size(88.dp), tint = Color.White.copy(alpha = 0.6f))
+                }
+            }
+        } else if (p.mode == PlayerMode.MUSIC && art != null) {
+            val image = remember(art) { art.asImageBitmap() }
+            Image(image, contentDescription = null, contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth(0.7f).aspectRatio(1f).clip(RoundedCornerShape(12.dp)))
         } else {
+            val icon = when (p.mode) {
+                PlayerMode.MUSIC -> Icons.Filled.MusicNote
+                PlayerMode.SCREEN -> Icons.Filled.Cast
+                else -> Icons.Filled.Tv
+            }
             Column(Modifier.fillMaxWidth().aspectRatio(16f / 9f), horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center) {
-                Icon(Icons.Filled.Tv, contentDescription = null, modifier = Modifier.size(88.dp),
+                Icon(icon, contentDescription = null, modifier = Modifier.size(88.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                 if (p.tvName != null) Text(stringResource(R.string.playing_on, p.tvName), color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -298,34 +351,66 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
         Spacer(Modifier.height(12.dp))
         Text(p.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 2,
             overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+        val byLine = listOfNotNull(p.artist, p.album).joinToString(" · ")
+        if (p.mode == PlayerMode.MUSIC && byLine.isNotEmpty()) {
+            Text(byLine, style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+        }
         Text(p.status, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+        if ((p.mode == PlayerMode.MUSIC || p.mode == PlayerMode.PHOTO) && p.count > 1) {
+            Text(stringResource(if (p.mode == PlayerMode.MUSIC) R.string.track_of else R.string.photo_of, p.index + 1, p.count),
+                style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Spacer(Modifier.height(8.dp))
 
-        val dur = clock.dur.toFloat()
-        val value = drag ?: clock.pos.toFloat()
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(fmtTime(value.toDouble()), style = MaterialTheme.typography.labelMedium)
-            Slider(
-                value = if (dur > 0) value.coerceIn(0f, dur) else 0f,
-                onValueChange = { drag = it; engine.scrub(it.toDouble()) },
-                onValueChangeFinished = { drag?.let { engine.scrubEnd(it.toDouble()) }; drag = null },
-                valueRange = 0f..maxOf(dur, 1f),
-                enabled = p.seekable,
-                modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
-            )
-            Text(if (dur > 0) fmtTime(clock.dur) else "--:--", style = MaterialTheme.typography.labelMedium)
+        if (video || p.mode == PlayerMode.MUSIC) {
+            val dur = clock.dur.toFloat()
+            val value = drag ?: clock.pos.toFloat()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(fmtTime(value.toDouble()), style = MaterialTheme.typography.labelMedium)
+                Slider(
+                    value = if (dur > 0) value.coerceIn(0f, dur) else 0f,
+                    onValueChange = { drag = it; engine.scrub(it.toDouble()) },
+                    onValueChangeFinished = { drag?.let { engine.scrubEnd(it.toDouble()) }; drag = null },
+                    valueRange = 0f..maxOf(dur, 1f),
+                    enabled = p.seekable,
+                    modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                )
+                Text(if (dur > 0) fmtTime(clock.dur) else "--:--", style = MaterialTheme.typography.labelMedium)
+            }
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            SkipButton(Icons.Filled.Replay30, R.string.back_30) { engine.skip(-30.0) }
-            SkipButton(Icons.Filled.Replay10, R.string.back_10) { engine.skip(-10.0) }
-            FilledIconButton(onClick = engine::togglePlay, modifier = Modifier.padding(horizontal = 8.dp).size(72.dp),
-                colors = IconButtonDefaults.filledIconButtonColors()) {
-                Icon(if (p.playing) Icons.Filled.Pause else Icons.Filled.PlayArrow, contentDescription = stringResource(R.string.play_pause),
-                    modifier = Modifier.size(40.dp))
+        when (p.mode) {
+            PlayerMode.VIDEO, PlayerMode.INTRO -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SkipButton(Icons.Filled.Replay30, R.string.back_30) { engine.skip(-30.0) }
+                SkipButton(Icons.Filled.Replay10, R.string.back_10) { engine.skip(-10.0) }
+                PlayButton(p.playing, R.string.play_pause) { engine.togglePlay() }
+                SkipButton(Icons.Filled.Forward10, R.string.forward_10) { engine.skip(10.0) }
+                SkipButton(Icons.Filled.Forward30, R.string.forward_30) { engine.skip(30.0) }
             }
-            SkipButton(Icons.Filled.Forward10, R.string.forward_10) { engine.skip(10.0) }
-            SkipButton(Icons.Filled.Forward30, R.string.forward_30) { engine.skip(30.0) }
+            PlayerMode.MUSIC -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SkipButton(Icons.Filled.SkipPrevious, R.string.previous_track) { engine.previousTrack() }
+                SkipButton(Icons.Filled.Replay10, R.string.back_10) { engine.skip(-10.0) }
+                PlayButton(p.playing, R.string.play_pause) { engine.togglePlay() }
+                SkipButton(Icons.Filled.Forward10, R.string.forward_10) { engine.skip(10.0) }
+                SkipButton(Icons.Filled.SkipNext, R.string.next_track, enabled = p.index + 1 < p.count) { engine.nextTrack() }
+            }
+            PlayerMode.PHOTO -> if (p.count > 1) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SkipButton(Icons.Filled.SkipPrevious, R.string.previous_photo) { engine.previousPhoto() }
+                    PlayButton(p.slideshow, R.string.slideshow) { engine.toggleSlideshow() }
+                    SkipButton(Icons.Filled.SkipNext, R.string.next_photo) { engine.nextPhoto() }
+                }
+                Text(stringResource(R.string.slideshow_every), style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally), modifier = Modifier.fillMaxWidth()) {
+                    for (s in listOf(3, 5, 10, 20, 30)) {
+                        FilterChip(selected = p.slideSeconds == s, onClick = { engine.setSlideSeconds(s) },
+                            label = { Text(stringResource(R.string.seconds_short, s)) })
+                    }
+                }
+            }
+            PlayerMode.SCREEN -> Text(stringResource(if (p.sound) R.string.screen_note_sound else R.string.screen_note),
+                style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 8.dp))
         }
         Spacer(Modifier.height(12.dp))
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
@@ -347,7 +432,7 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
             }
         }
         val volume = ui.volume
-        if (volume != null) {
+        if (volume != null && p.mode != PlayerMode.PHOTO) {
             var volDrag by remember { mutableStateOf<Float?>(null) }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
                 Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = stringResource(R.string.tv_volume))
@@ -367,9 +452,18 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
 }
 
 @Composable
-private fun SkipButton(icon: ImageVector, label: Int, onClick: () -> Unit) {
-    FilledTonalIconButton(onClick = onClick, modifier = Modifier.size(52.dp)) {
+private fun SkipButton(icon: ImageVector, label: Int, enabled: Boolean = true, onClick: () -> Unit) {
+    FilledTonalIconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(52.dp)) {
         Icon(icon, contentDescription = stringResource(label), modifier = Modifier.size(28.dp))
+    }
+}
+
+@Composable
+private fun PlayButton(playing: Boolean, label: Int, onClick: () -> Unit) {
+    FilledIconButton(onClick = onClick, modifier = Modifier.padding(horizontal = 8.dp).size(72.dp),
+        colors = IconButtonDefaults.filledIconButtonColors()) {
+        Icon(if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow, contentDescription = stringResource(label),
+            modifier = Modifier.size(40.dp))
     }
 }
 
@@ -383,6 +477,7 @@ private fun OptionsBar(ui: UiState, engine: Engine) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalArrangement = Arrangement.Center) {
                 Toggle(stringResource(R.string.show_on_phone), ui.previewOn) { engine.setPreview(it) }
                 Toggle(stringResource(R.string.skynet_intro), ui.introOn) { engine.setIntro(it) }
+                Toggle(stringResource(R.string.screen_hd), ui.screenHd) { engine.setScreenHd(it) }
             }
             ui.introProgress?.let { p ->
                 Text(stringResource(R.string.preparing_intro_pct, (p * 100).toInt()), style = MaterialTheme.typography.bodySmall,
@@ -426,8 +521,11 @@ private fun DeviceSheet(ui: UiState, engine: Engine, onDismiss: () -> Unit) {
             LazyColumn(Modifier.weight(1f, fill = false)) {
                 items(ui.devices, key = { it.ip }) { d -> DeviceRow(d, ui, engine, onDismiss) }
                 item {
-                    Text(stringResource(R.string.devices_hint), style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 10.dp))
+                    for (hint in listOf(R.string.devices_hint, R.string.help_philips, R.string.help_cast)) {
+                        Text(stringResource(hint), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
+                    }
+                    Spacer(Modifier.height(10.dp))
                     HorizontalDivider()
                     AddressEntry(engine, onDismiss)
                 }
@@ -459,6 +557,8 @@ private fun DeviceRow(d: NetDevice, ui: UiState, engine: Engine, onDismiss: () -
         NetDevice.Note.NETWORK_DEVICE -> "✗ " + stringResource(R.string.network_device_cant) to MaterialTheme.colorScheme.onSurfaceVariant
         NetDevice.Note.NO_CASTING -> "✗ " + stringResource(R.string.no_casting) to MaterialTheme.colorScheme.onSurfaceVariant
         NetDevice.Note.THIS_DEVICE -> stringResource(R.string.this_phone) to MaterialTheme.colorScheme.onSurfaceVariant
+        NetDevice.Note.DMR_OFF -> "✗ " + stringResource(R.string.dmr_off) to Color(0xFFC88800)
+        NetDevice.Note.CAST_ONLY -> "✗ " + stringResource(R.string.cast_only) to MaterialTheme.colorScheme.onSurfaceVariant
     }
     val tv = d.tv
     val inUse = tv != null && d.ip == ui.tvHost
@@ -482,7 +582,7 @@ private fun DeviceRow(d: NetDevice, ui: UiState, engine: Engine, onDismiss: () -
                     Text(stringResource(R.string.in_use), style = MaterialTheme.typography.labelMedium)
                 }
                 d.canPlay && tv != null -> FilledTonalButton(onClick = { engine.selectTv(tv); onDismiss() }) {
-                    Text(stringResource(R.string.use_this_tv))
+                    Text(stringResource(if (d.musicOnly) R.string.use_for_music else R.string.use_this_tv))
                 }
             }
         },

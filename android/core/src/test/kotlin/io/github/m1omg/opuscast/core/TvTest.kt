@@ -10,8 +10,12 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/** A pretend Samsung TV: device description, SCPD, SOAP control and GENA. */
-class FakeTv(samsung: Boolean = true) : AutoCloseable {
+/** A pretend Samsung TV: device description, SCPD, SOAP control and GENA. Or another make:
+ *  [sink] is its format list (null: no ConnectionManager, like the Samsung this started from), Play
+ *  answers 701 [playBusy] times first, [relTime] = false refuses REL_TIME seeks, [startsBySelf] starts
+ *  playing on SetAVTransportURI. */
+class FakeTv(samsung: Boolean = true, sink: String? = null, @Volatile var playBusy: Int = 0, relTime: Boolean = true,
+             startsBySelf: Boolean = false) : AutoCloseable {
     private val http = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
     val calls: MutableList<Pair<String, String>> = Collections.synchronizedList(ArrayList()) // (action, body)
     @Volatile var state = "STOPPED"
@@ -27,6 +31,8 @@ class FakeTv(samsung: Boolean = true) : AutoCloseable {
               <eventSubURL>/upnp/event/AVTransport1</eventSubURL><SCPDURL>/av.xml</SCPDURL></service>
             <service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><controlURL>/upnp/control/RenderingControl1</controlURL>
               <eventSubURL>/upnp/event/RenderingControl1</eventSubURL><SCPDURL>/rc.xml</SCPDURL></service>
+            ${if (sink == null) "" else "<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>" +
+                "<controlURL>/upnp/control/ConnectionManager1</controlURL><SCPDURL>/cm.xml</SCPDURL></service>"}
             </serviceList></device></root>"""
         val rcActions = listOf("GetVolume", "SetVolume") + if (samsung) listOf("X_ControlCaption", "X_GetCaptionState") else emptyList()
         val rc = "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\"><actionList>" +
@@ -51,6 +57,7 @@ class FakeTv(samsung: Boolean = true) : AutoCloseable {
             val out = when (action) {
                 "SetAVTransportURI" -> {
                     uri = xmlUnescape(Regex("<CurrentURI>([^<]*)</CurrentURI>").find(body)!!.groupValues[1])
+                    if (startsBySelf) state = "PLAYING"
                     // like a TV: fetch the start of the file
                     runCatching {
                         val c = java.net.URL(uri).openConnection()
@@ -60,10 +67,11 @@ class FakeTv(samsung: Boolean = true) : AutoCloseable {
                     }
                     ""
                 }
-                "Play" -> { state = "PLAYING"; "" }
+                "Play" -> if (playBusy > 0) { playBusy -= 1; "busy" } else { state = "PLAYING"; "" }
                 "Stop" -> { state = "STOPPED"; "" }
                 "Pause" -> { state = "PAUSED_PLAYBACK"; "" }
-                "Seek" -> ""
+                "Seek" -> if (!relTime && "<Unit>REL_TIME</Unit>" in body) "badseek" else ""
+                "GetProtocolInfo" -> "<Source></Source><Sink>${xmlEscape(sink ?: "")}</Sink>"
                 "GetTransportInfo" -> "<CurrentTransportState>$state</CurrentTransportState>"
                 "GetPositionInfo" -> "<TrackDuration>0:10:00</TrackDuration><RelTime>0:00:42</RelTime><TrackURI>${xmlEscape(uri)}</TrackURI>"
                 "GetVolume" -> "<CurrentVolume>23</CurrentVolume>"
@@ -73,9 +81,14 @@ class FakeTv(samsung: Boolean = true) : AutoCloseable {
                 "Explode" -> null
                 else -> null
             }
+            fun fault(code: Int, text: String) = reply(ex, 500, "<s:Envelope><s:Body><s:Fault><detail><UPnPError>" +
+                "<errorCode>$code</errorCode><errorDescription>$text</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>")
             if (out == null) {
-                reply(ex, 500, "<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>401</errorCode>" +
-                    "<errorDescription>Invalid Action</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>")
+                fault(401, "Invalid Action")
+            } else if (out == "busy") {
+                fault(701, "Transition not available")
+            } else if (out == "badseek") {
+                fault(710, "Seek mode not supported")
             } else {
                 reply(ex, 200, "<?xml version=\"1.0\"?><s:Envelope><s:Body><u:${action}Response>$out</u:${action}Response></s:Body></s:Envelope>")
             }
@@ -166,5 +179,115 @@ class TvTest {
             assertTrue("X_ControlCaption" !in lg.actions())
             assertEquals("unsupported", showSubtitle(tv, server, media, media.subPath))
         }
+    }
+
+    private fun didlOf(fake: FakeTv) =
+        xmlUnescape(Regex("<CurrentURIMetaData>([^<]*)</CurrentURIMetaData>").find(fake.body("SetAVTransportURI"))!!.groupValues[1])
+
+    @Test fun readsTheTvsFormatList() {
+        val sink = "http-get:*:video/x-matroska:*,http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC,http-get:*:audio/x-flac:*," +
+            "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM,http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG,rtsp-rtp-udp:*:video/x-ms-wmv:*"
+        FakeTv(samsung = false, sink = sink).use { philips ->
+            val tv = Tv.fromLocation(philips.location)
+            val formats = tv.sink()
+            assertEquals(true, tv.playsVideo())
+            assertEquals("video/x-matroska", formats.spell("video/x-mkv"))
+            assertEquals("audio/x-flac", formats.spell("audio/flac"))
+            assertEquals(false, formats.accepts("audio/wav")) // L16 is raw PCM, not a WAV file
+            assertEquals(false, formats.accepts("video/x-ms-wmv")) // only over RTSP
+            assertEquals(true, formats.accepts("image/jpeg"))
+            assertTrue(tv.sink() === formats) // asked once
+            assertEquals(1, philips.actions().count { it == "GetProtocolInfo" })
+        }
+        FakeTv(samsung = false, sink = "http-get:*:audio/mpeg:*,http-get:*:audio/x-flac:*").use { speaker ->
+            assertEquals(false, Tv.fromLocation(speaker.location).playsVideo())
+        }
+    }
+
+    @Test fun playIsRetriedWhileTheTvIsBusy() {
+        FakeTv(playBusy = 2).use { busy ->
+            val tv = Tv.fromLocation(busy.location)
+            val file = File.createTempFile("Film", ".mp4").apply { writeBytes(ByteArray(100)); deleteOnExit() }
+            startPlayback(tv, server, FileSource(file))
+            assertEquals(3, busy.actions().count { it == "Play" })
+            assertEquals("PLAYING", busy.state)
+        }
+        FakeTv(playBusy = 100, startsBySelf = true).use { self -> // busy, but it started by itself: that counts
+            val tv = Tv.fromLocation(self.location)
+            val file = File.createTempFile("Film", ".mp4").apply { writeBytes(ByteArray(100)); deleteOnExit() }
+            startPlayback(tv, server, FileSource(file))
+            assertEquals(1, self.actions().count { it == "Play" })
+        }
+        FakeTv(playBusy = 100).use { stuck ->
+            val tv = Tv.fromLocation(stuck.location)
+            val e = assertFailsWith<TvException> { playAfterSet(tv, pauseMs = 5) }
+            assertEquals(701, e.upnpCode)
+            assertEquals(5, stuck.actions().count { it == "Play" })
+        }
+    }
+
+    @Test fun seekFallsBackToAbsTime() {
+        FakeTv(relTime = false).use { old ->
+            val tv = Tv.fromLocation(old.location)
+            tv.seek(90.0)
+            assertTrue("<Unit>ABS_TIME</Unit>" in old.body("Seek"))
+            assertTrue("<Target>00:01:30</Target>" in old.body("Seek"))
+        }
+        tvAt(fake).seek(5.0)
+        assertEquals(1, fake.actions().count { it == "Seek" }) // REL_TIME worked
+    }
+
+    private fun tvAt(f: FakeTv) = Tv.fromLocation(f.location)
+
+    @Test fun musicGoesWithArtistAlbumAndCover() {
+        val tv = tvAt(fake)
+        val file = File.createTempFile("01 Song", ".mp3").apply { writeBytes(ByteArray(300)); deleteOnExit() }
+        val media = server.publish(FileSource(file))
+        assertEquals(MediaKind.AUDIO, media.kind)
+        assertTrue(media.urlPath.endsWith(".mp3"))
+        media.artist = "Hudba & Spol."
+        media.album = "Album"
+        media.knownDurationMs = 205_000
+        media.coverPath = server.addExtra(media, ".jpg", "image/jpeg", byteArrayOf(1, 2, 3))
+        playMedia(tv, server, media, startAt = 0.0)
+        val d = didlOf(fake)
+        assertTrue("<upnp:class>object.item.audioItem.musicTrack</upnp:class>" in d, d)
+        assertTrue("<upnp:artist>Hudba &amp; Spol.</upnp:artist>" in d, d)
+        assertTrue("<dc:creator>Hudba &amp; Spol.</dc:creator>" in d)
+        assertTrue("<upnp:album>Album</upnp:album>" in d)
+        assertTrue("<upnp:albumArtURI dlna:profileID=\"JPEG_TN\">${server.urlFor(tv.host, media.coverPath!!)}</upnp:albumArtURI>" in d, d)
+        assertTrue("duration=\"0:03:25.000\"" in d)
+        assertTrue("http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01" in d)
+        assertTrue("pv:subtitleFileUri" !in d)
+    }
+
+    @Test fun photosGoFromOneToTheNextWithoutStopping() {
+        val tv = tvAt(fake)
+        val photo = BytesSource("IMG_0001.jpg", ByteArray(2000), mime = "image/jpeg", kind = MediaKind.IMAGE)
+        val media = server.publish(photo, mime = "image/jpeg", features = Dlna.image("image/jpeg", 4000, 3000, converted = true))
+        playMedia(tv, server, media, startAt = 30.0, stopFirst = false)
+        val acts = fake.actions()
+        assertEquals("SetAVTransportURI", acts.first { it in setOf("Stop", "SetAVTransportURI") })
+        assertTrue("Seek" !in acts)
+        val d = didlOf(fake)
+        assertTrue("<upnp:class>object.item.imageItem.photo</upnp:class>" in d, d)
+        assertTrue("http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=00f0" in d, d)
+        assertTrue("size=\"2000\"" in d)
+    }
+
+    @Test fun liveStreamIsAnnouncedWithoutSizeOrSeeking() {
+        val tv = tvAt(fake)
+        val hub = LiveHub()
+        val media = server.publishLive(hub, "Phone screen")
+        assertTrue(media.urlPath.endsWith(".ts"))
+        assertEquals(MediaKind.LIVE, media.kind)
+        // the fake TV reads what it fetches to the end: end the stream so it gets there
+        kotlin.concurrent.thread { Thread.sleep(300); hub.close() }
+        playMedia(tv, server, media)
+        val d = didlOf(fake)
+        assertTrue("<upnp:class>object.item.videoItem</upnp:class>" in d)
+        assertTrue("http-get:*:video/mpeg:DLNA.ORG_OP=00;DLNA.ORG_CI=1;" in d, d)
+        assertTrue("size=" !in d)
+        hub.close()
     }
 }
