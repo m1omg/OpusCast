@@ -56,6 +56,24 @@ def _gst_pipewire():
 # ---------------------------------------------------------------- encoding
 
 _encoder, _encoder_lock = None, threading.Lock()
+_queue_ok, _queue_lock = None, threading.Lock()
+
+
+def input_queue(packets):
+    """["-thread_queue_size", packets] to put before a live input, if this ffmpeg takes it there: up to
+    ffmpeg 9.0 it keeps a short encoder stall from losing sound. Later ffmpeg sizes its input queues
+    itself and refuses the option before an input (it only sets the muxer's queue now): then nothing."""
+    global _queue_ok
+    with _queue_lock:
+        if _queue_ok is None:
+            try:
+                _queue_ok = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-nostdin", "-thread_queue_size", "8", "-f", "lavfi", "-i",
+                     "anullsrc", "-t", "0.1", "-f", "null", "-"],
+                    capture_output=True, timeout=15, **core.NO_WINDOW).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                _queue_ok = False
+    return ["-thread_queue_size", str(packets)] if _queue_ok else []
 
 
 def video_encoder():
@@ -227,7 +245,7 @@ class _Loopback:
         self.running = True
 
     def ffmpeg_input(self):
-        return ["-thread_queue_size", "1024", "-f", "s16le", "-ar", str(self.rate), "-ac", str(self.channels),
+        return [*input_queue(1024), "-f", "s16le", "-ar", str(self.rate), "-ac", str(self.channels),
                 "-i", "pipe:0"]
 
     def run(self, write):
@@ -542,10 +560,10 @@ class DesktopCast:
         except core.TVError as e:
             self._fail(done, str(e))
             return
-        audio = ["-thread_queue_size", "1024", "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
+        audio = [*input_queue(1024), "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
                  "-fragment_size", "4096", "-i", self.sound] if self.sound else SILENCE
         display = os.environ.get("DISPLAY", ":0")
-        grab = ["-thread_queue_size", "64", "-f", "x11grab", "-draw_mouse", "1", "-framerate", str(self.fps)]
+        grab = [*input_queue(64), "-f", "x11grab", "-draw_mouse", "1", "-framerate", str(self.fps)]
         if self.area:
             x, y, w, h = self.area
             grab += ["-video_size", f"{w - w % 2}x{h - h % 2}", "-i", f"{display}+{x},{y}"]
@@ -565,7 +583,7 @@ class DesktopCast:
                 self.loopback = _Loopback()
             except Exception:  # noqa: BLE001 - PortAudio errors come in many types
                 self.sound = None  # the picture still goes, without sound
-        grab = ["-thread_queue_size", "64", "-f", "gdigrab", "-framerate", str(self.fps), "-draw_mouse", "1"]
+        grab = [*input_queue(64), "-f", "gdigrab", "-framerate", str(self.fps), "-draw_mouse", "1"]
         if self.area:
             x, y, w, h = self.area
             grab += ["-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w - w % 2}x{h - h % 2}"]
@@ -599,7 +617,7 @@ class DesktopCast:
         except core.TVError as e:
             self._fail(done, str(e))
             return
-        grab = ["-thread_queue_size", "64", "-f", "avfoundation", "-capture_cursor", "1", "-framerate",
+        grab = [*input_queue(64), "-f", "avfoundation", "-capture_cursor", "1", "-framerate",
                 str(self.fps), "-i", f"{video}:{sound if sound is not None else 'none'}"]
         if sound is None:
             self.sound = None
@@ -613,9 +631,9 @@ class DesktopCast:
         except Exception as e:  # noqa: BLE001 - GStreamer errors come in many types
             self._fail(done, str(e))
             return
-        audio = ["-thread_queue_size", "1024", "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
+        audio = [*input_queue(1024), "-f", "pulse", "-sample_rate", "48000", "-channels", "2",
                  "-fragment_size", "4096", "-i", self.sound] if self.sound else SILENCE
-        raw = ["-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+        raw = [*input_queue(64), "-f", "rawvideo", "-pix_fmt", "yuv420p",
                "-video_size", f"{self.width}x{self.height}", "-framerate", str(self.fps),
                "-use_wallclock_as_timestamps", "1", "-i", "pipe:0"]
         if not self._run(done, [*pre, *raw, *audio, "-vf", vf, "-r", str(self.fps), *out], stdin=subprocess.PIPE,
@@ -667,7 +685,8 @@ class DesktopCast:
     def _why(self):
         """ffmpeg's own reason: its last lines are often just "Error opening input files", the line
         before says what really failed."""
-        generic = re.compile(r"^(Error opening (input|output)|Conversion failed|Error while|\[(in|out)#\d)", re.I)
+        generic = re.compile(r"^(Error (opening|parsing options for) (input|output)|Conversion failed|Error while|"
+                             r"\[(in|out)#\d)", re.I)
         specific = [line for line in self._log if not generic.match(line)]
         return (specific or self._log or [None])[-1]
 

@@ -73,7 +73,6 @@ jobs:
       - name: Try the command line against a fake TV (songs, photos)
         run: PATH="$PWD/build-extra/ffmpeg:$PATH" python tests/smoke.py
       - name: Try casting the desktop against the fake TV
-        continue-on-error: true  # the runner's desktop session may not allow screen grabs
         run: |
           echo "--- can ffmpeg grab this runner's screen at all?"
           build-extra/ffmpeg/ffmpeg.exe -hide_banner -f gdigrab -framerate 30 -i desktop -t 2 -f null - 2>&1 | tail -8 || true
