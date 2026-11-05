@@ -1721,8 +1721,13 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                                 features=prep["features"],
                                 meta={"resolution": f"{prep['w']}x{prep['h']}"} if prep["w"] else None)
         ours = prev["ours"] if prev and prev["kind"] == "photo" else []
+        warned = bool(prev and prev["kind"] == "photo" and prev.get("warned"))
         self._start_session("photo", path, 0, media=m, title=os.path.basename(path), queue=files, index=index,
-                            ours=ours)
+                            ours=ours, warned=warned or bool(prep.get("unconverted")))
+        if prep.get("unconverted") and not warned:  # once per slideshow
+            self.show_info(_("The TV may not show {name}: this PC can't convert this kind of photo. "
+                             "This helps:").format(name=os.path.basename(path)), WARNING,
+                           selectable=core.install_hint(["photos"]))
         self._set_art(shown)
         self._update_status()
         if self.slideshow:

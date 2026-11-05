@@ -186,6 +186,9 @@ def show_photos(tv, server, photos, every):
                                features=prep["features"])
         start(tv, server, path, media_obj=photo)
         print(f"[{n % len(photos) + 1}/{len(photos)}] {os.path.basename(path)}")
+        if prep.get("unconverted"):
+            print("  " + _("The TV may not show {name}: this PC can't convert this kind of photo. "
+                           "This helps:").format(name=os.path.basename(path)) + " " + core.install_hint(["photos"]))
         if len(photos) == 1:
             print(_("(Ctrl+C takes it off the TV)"))
             while True:

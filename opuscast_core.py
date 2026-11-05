@@ -1513,18 +1513,21 @@ PACKAGES = {  # what to install, per distro family
         "gst-good": "gstreamer1.0-plugins-good", "gst-gtk": "gstreamer1.0-gtk3 gstreamer1.0-gl",
         "gst-libav": "gstreamer1.0-libav", "gst-va": "gstreamer1.0-plugins-bad",
         "intro": "python3-cairo ffmpeg", "subs": "ffmpeg", "desktop": "ffmpeg",
-        "desktop-wayland": "python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-pipewire"}),
+        "desktop-wayland": "python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-pipewire",
+        "photos": "heif-gdk-pixbuf webp-pixbuf-loader"}),
     "arch": ("sudo pacman -S --needed", {
         "gtk": "python-gobject gtk3", "gst": "gstreamer gst-plugins-base",
         "gst-good": "gst-plugins-good", "gst-gtk": "gst-plugin-gtk",
         "gst-libav": "gst-libav", "gst-va": "gst-plugin-va", "intro": "python-cairo ffmpeg", "subs": "ffmpeg",
-        "desktop": "ffmpeg", "desktop-wayland": "python-gobject gstreamer gst-plugins-base gst-plugin-pipewire"}),
+        "desktop": "ffmpeg", "desktop-wayland": "python-gobject gstreamer gst-plugins-base gst-plugin-pipewire",
+        "photos": "libheif webp-pixbuf-loader"}),
     "fedora": ("sudo dnf install", {
         "gtk": "python3-gobject gtk3", "gst": "gstreamer1 gstreamer1-plugins-base",
         "gst-good": "gstreamer1-plugins-good", "gst-gtk": "gstreamer1-plugins-good-gtk",
         "gst-libav": "gstreamer1-plugin-libav", "gst-va": "gstreamer1-plugins-bad-free",
         "intro": "python3-cairo ffmpeg-free", "subs": "ffmpeg-free", "desktop": "ffmpeg-free",
-        "desktop-wayland": "python3-gobject gstreamer1 gstreamer1-plugins-base pipewire-gstreamer"}),
+        "desktop-wayland": "python3-gobject gstreamer1 gstreamer1-plugins-base pipewire-gstreamer",
+        "photos": "webp-pixbuf-loader"}),
 }
 GENERIC = {
     "gtk": "PyGObject + GTK 3", "gst": "GStreamer 1.x (Python bindings, base plugins)",
@@ -1532,6 +1535,7 @@ GENERIC = {
     "gst-libav": "GStreamer libav plugin", "gst-va": "GStreamer VA-API plugin",
     "intro": "pycairo + ffmpeg", "subs": "ffmpeg", "desktop": "ffmpeg",
     "desktop-wayland": "PyGObject + GStreamer with its PipeWire plugin",
+    "photos": "GdkPixbuf loaders for HEIC (libheif) and WebP (webp-pixbuf-loader)",
 }
 
 

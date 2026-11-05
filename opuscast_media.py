@@ -167,7 +167,8 @@ def prepare_photo(path, tv=None):
         data, w, h = to_jpeg(path, PHOTO_BOX)
         if data is None:  # nothing here can read it: let the TV try the original
             mime = core.IMAGE_MIME.get(os.path.splitext(path)[1].lower(), "image/jpeg")
-            out = {"file": path, "mime": mime, "w": info["w"], "h": info["h"], "converted": False}
+            out = {"file": path, "mime": mime, "w": info["w"], "h": info["h"], "converted": False,
+                   "unconverted": info["fmt"] not in ("jpeg", "png")}
         else:
             out = {"data": data, "mime": "image/jpeg", "w": w, "h": h, "converted": True}
     out["features"] = photo_features(out["mime"], out["w"], out["h"], out["converted"])

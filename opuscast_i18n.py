@@ -319,6 +319,8 @@ SK = {
     "60 pictures a second - needs a fast PC": "60 snímok za sekundu – potrebuje rýchly počítač",
     "Use this speaker": "Použiť tento reproduktor",
     "Screen {n}": "Obrazovka {n}",
+    "The TV may not show {name}: this PC can't convert this kind of photo. This helps:":
+        "Televízor možno {name} neukáže: tento počítač tento druh fotiek nevie previesť. Pomôže toto:",
     "(keep this open - Ctrl+C stops)": "(nechajte toto otvorené – Ctrl+C zastaví)",
     "Play videos, music and photos from this PC on your TV, or show it the desktop.":
         "Prehrá videá, hudbu a fotky z tohto počítača v televízore alebo mu ukáže pracovnú plochu.",
