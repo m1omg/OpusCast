@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from opuscast_i18n import _  # noqa: E402
 
 APP_NAME = "OpusCast"
+APP_VERSION = "1.1"
 APP_ID = "io.github.m1omg.OpusCast"
 DEFAULT_PORT = 8765
 RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
@@ -74,9 +75,25 @@ MIME_ALIASES = (
     ("image/jpeg", "image/jpg"),
 )
 _ALIASES = {m: group for group in MIME_ALIASES for m in group}
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "opuscast")
+
+
+def app_dirs():
+    """(settings folder, cache folder) where each system keeps them. XDG_CONFIG_HOME / XDG_CACHE_HOME
+    still win anywhere, so tests and portable setups can point them elsewhere."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32" and not os.environ.get("XDG_CONFIG_HOME"):
+        roaming = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        return os.path.join(roaming, APP_NAME), os.path.join(local, APP_NAME, "cache")
+    if sys.platform == "darwin" and not os.environ.get("XDG_CONFIG_HOME"):
+        return (os.path.join(home, "Library", "Application Support", APP_NAME),
+                os.path.join(home, "Library", "Caches", APP_NAME))
+    return (os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "opuscast"),
+            os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache"), "opuscast"))
+
+
+CONFIG_DIR, CACHE_DIR = app_dirs()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "opuscast")
 DESC_ERRORS = (OSError, ET.ParseError, ValueError)
 
 
@@ -574,7 +591,25 @@ TV_BRANDS = ("samsung", "lg electronics", "sony", "hisense", "tcl", "philips", "
 KIND_ORDER = {"tv": 0, "speaker": 1, "router": 2, "upnp": 3, "unknown": 4, "pc": 5}
 
 
+def _run_text(cmd, timeout=4):
+    """A system tool's output ('' if it isn't there), without a console window popping up on Windows."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace",
+                              **NO_WINDOW).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+NO_WINDOW = {"creationflags": 0x08000000} if sys.platform == "win32" else {}  # CREATE_NO_WINDOW
+
+
 def _default_gateway():
+    if sys.platform == "win32":
+        m = re.search(r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)", _run_text(["route", "print", "-4"]), re.M)
+        return m.group(1) if m else None
+    if sys.platform == "darwin":
+        m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", _run_text(["route", "-n", "get", "default"]))
+        return m.group(1) if m else None
     try:
         with open("/proc/net/route") as f:
             for line in f.readlines()[1:]:
@@ -593,13 +628,25 @@ def _local_net():
     except OSError:
         return None, 24
     prefix = 24
+    if sys.platform == "darwin":  # "inet 192.168.1.5 netmask 0xffffff00 ..."
+        m = re.search(rf"inet {re.escape(ip)} netmask 0x([0-9a-f]+)", _run_text(["ifconfig"]))
+        return ip, bin(int(m.group(1), 16)).count("1") if m else prefix
+    if sys.platform == "win32":  # the mask shows a few lines below the address
+        out = _run_text(["ipconfig"])
+        i = out.find(ip)
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out[i + len(ip):i + len(ip) + 200]) if i >= 0 else None
+        if m:
+            try:
+                prefix = ipaddress.ip_network(f"0.0.0.0/{m.group(1)}").prefixlen
+            except ValueError:
+                pass
+        return ip, prefix
     try:
-        out = subprocess.run(["ip", "-j", "-4", "addr", "show"], capture_output=True, text=True, timeout=3).stdout
-        for iface in json.loads(out or "[]"):
+        for iface in json.loads(_run_text(["ip", "-j", "-4", "addr", "show"]) or "[]"):
             for a in iface.get("addr_info", []):
                 if a.get("local") == ip:
                     prefix = int(a.get("prefixlen", 24))
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (ValueError, TypeError):
         pass
     return ip, prefix
 
@@ -618,6 +665,14 @@ def _wake_neighbours(ip, prefix):
 
 def _arp_table():
     table = {}
+    if sys.platform in ("win32", "darwin"):
+        # Windows: "  192.168.1.1   aa-bb-cc-dd-ee-ff   dynamic"; macOS: "? (192.168.1.1) at a:b:c:d:e:f on en0"
+        for ip, mac in re.findall(r"(\d+\.\d+\.\d+\.\d+)\)?\s+(?:at\s+)?([0-9a-fA-F]{1,2}(?:[:-][0-9a-fA-F]{1,2}){5})",
+                                  _run_text(["arp", "-a"] if sys.platform == "win32" else ["arp", "-an"])):
+            mac = ":".join(f"{int(x, 16):02x}" for x in re.split("[:-]", mac))
+            if mac not in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00") and not ip.startswith(("224.", "239.", "255.")):
+                table[ip] = mac
+        return table
     try:
         with open("/proc/net/arp") as f:
             for line in f.readlines()[1:]:

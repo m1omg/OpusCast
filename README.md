@@ -40,6 +40,9 @@ that TV's own names for them, retries when a TV is still busy, and seeks the way
 
 **Android:** there's an Android version too, in [android/](android/README.md).
 
+**Windows and macOS:** the same app for Windows 10/11 and for Macs with macOS 12 Monterey or newer
+(Intel and Apple silicon), see [below](#windows-and-macos).
+
 ## Install
 
 ```sh
@@ -66,6 +69,27 @@ The installer checks what's missing and prints the right command for your distro
 Works on X11 and Wayland, with any desktop (Cinnamon, KDE, GNOME, …). Casting the desktop on Wayland
 also needs the desktop's screen-sharing portal (`xdg-desktop-portal-kde` / `-gnome` / `-wlr`), which
 KDE, GNOME and Sway install already. The PC's sound comes from PipeWire or PulseAudio.
+
+## Windows and macOS
+
+Download from [Releases](https://github.com/m1omg/OpusCast/releases): `…-Windows-Setup.exe` (or the
+`…-Windows.zip` to run without installing) and `…-macOS.dmg`. Everything is inside, ffmpeg included:
+videos with subtitles, *Show on PC*, music, photos, casting the desktop, the Skynet intro.
+
+The apps aren't signed by Microsoft or Apple (that costs a yearly fee), so the first start needs a click more:
+
+- **Windows:** SmartScreen says "Windows protected your PC" → *More info* → *Run anyway*. When Windows
+  asks whether OpusCast may use the network, allow it on *Private networks*, or the TV can't fetch anything.
+- **macOS 12–14:** drag OpusCast to Applications, then right-click it → *Open* → *Open*.
+  **macOS 15:** open it once, then System Settings → Privacy & Security → *Open Anyway*.
+- **Casting the desktop on a Mac** needs *Screen Recording* allowed for OpusCast (macOS asks the first
+  time; then start OpusCast again). macOS doesn't let apps record the Mac's sound by itself: install
+  [BlackHole](https://existential.audio/blackhole/) (free) and choose it as the output (or a Multi-Output
+  Device with BlackHole and your speakers, in Audio MIDI Setup), and the sound goes to the TV too.
+- On Windows the PC's sound goes along by itself.
+
+To run it from the source instead: Python 3.9+, `pip install PySide6 PyAudioWPatch` (the latter on Windows),
+ffmpeg on the PATH, then `python opuscast_qt.py`. It runs on Linux too.
 
 ## Subtitles
 

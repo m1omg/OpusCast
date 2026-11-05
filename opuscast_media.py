@@ -59,9 +59,15 @@ def collect(paths):
         elif os.path.isfile(p):
             files.append(os.path.abspath(p))
     for kind in ("video", "audio", "image"):
-        chosen = [f for f in files if core.media_kind(f) == kind]
+        chosen = list(dict.fromkeys(f for f in files if core.media_kind(f) == kind))
+        if chosen and kind == "audio":  # an album in its order, however the files arrived
+            tags = {f: audio_tags(f, cover=False) for f in chosen}
+            chosen.sort(key=lambda f: (os.path.dirname(f), tags[f].get("disc") or 0, tags[f].get("track") or 0,
+                                       natural_key(f)))
+        elif chosen and kind == "image":
+            chosen.sort(key=lambda f: (os.path.dirname(f), natural_key(f)))
         if chosen:
-            return kind, list(dict.fromkeys(chosen))
+            return kind, chosen
     return None, []
 
 
