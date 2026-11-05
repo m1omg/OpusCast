@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from opuscast_i18n import _  # noqa: E402
 
 APP_NAME = "OpusCast"
-APP_VERSION = "1.1"
+APP_VERSION = "1.0"
 APP_ID = "io.github.m1omg.OpusCast"
 DEFAULT_PORT = 8765
 RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"

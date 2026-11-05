@@ -1844,10 +1844,11 @@ class OpusCastWindow(QMainWindow):
         sc = sc or self.screen() or QApplication.primaryScreen()
         if sc is None:
             return None
+        if sys.platform == "win32":  # with screens at different scales only Windows knows the real pixels
+            rect = _windows_monitors().get(sc.name())
+            if rect:
+                return rect
         g, r = sc.geometry(), sc.devicePixelRatio()
-        if sys.platform == "win32":  # the virtual desktop in real pixels: each screen at its own scale
-            g = sc.nativeGeometry() if hasattr(sc, "nativeGeometry") else g
-            return round(g.x() * r), round(g.y() * r), round(g.width() * r), round(g.height() * r)
         return round(g.x() * r), round(g.y() * r), round(g.width() * r), round(g.height() * r)
 
     def cast_desktop(self):
@@ -2295,6 +2296,33 @@ class OpusCastWindow(QMainWindow):
         self._save()
         self.server.close()
         event.accept()
+
+
+def _windows_monitors():
+    """Windows: {"\\\\.\\DISPLAY1": (x, y, width, height)} in real pixels of the whole desktop, the
+    coordinates ffmpeg's screen grab uses (Qt names its screens the same way)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD), ("szDevice", wintypes.WCHAR * 32)]
+    found = {}
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT),
+                              wintypes.LPARAM)
+
+    def each(hmon, _hdc, _rect, _data):
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(MonitorInfo)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            r = info.rcMonitor
+            found[info.szDevice] = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        return True
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(each), 0)
+    except (AttributeError, OSError):
+        return {}
+    return found
 
 
 def _wrap(text, width):

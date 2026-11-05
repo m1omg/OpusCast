@@ -34,6 +34,14 @@ jobs:
           path: build-extra/skynet-intro-v*.mp4
           if-no-files-found: error
 
+  linux:
+    name: Linux command line against a fake TV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg xvfb
+      - run: xvfb-run -a python3 tests/smoke.py --desktop
+
   windows:
     needs: intro
     runs-on: windows-latest
