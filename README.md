@@ -1,10 +1,21 @@
 # OpusCast
 
-Play videos from your Linux PC on your smart TV. No apps on the TV, no servers to set up.
-OpusCast hands the file to the TV over your home network (DLNA / UPnP), so the **TV remote works**:
-pause, rewind and volume all work as usual.
+Play videos, music and photos from your Linux PC on your smart TV, or show it your desktop.
+No apps on the TV, no servers to set up. OpusCast hands the file to the TV over your home network
+(DLNA / UPnP), so the **TV remote works**: pause, rewind and volume all work as usual.
 
 - **Drop a video in the window** (or pick one, or right-click a video → *Open With → OpusCast*)
+- **Music:** pick or drop songs (or a folder) and they play one after another, with title, artist,
+  album and cover on the TV. MP3, FLAC, M4A/AAC, Ogg, Opus, WAV, WMA. A song in a format the TV doesn't
+  list (often Opus or Ogg) is converted to MP3 first (needs ffmpeg). DLNA speakers play music too.
+- **Photos:** a slideshow on the TV: pick one photo to flip through its whole folder, or pick several.
+  JPEG, PNG, HEIC, WebP, AVIF, GIF, BMP, TIFF. Photos are turned upright, and ones the TV can't
+  show (HEIC from phones, huge ones) are converted to JPEG on the way.
+- **Cast the desktop:** the PC's screen and sound live on the TV, a second or two behind, so it's
+  for slides, photos and videos rather than games. Works on X11 (Cinnamon, MATE, Xfce, …) by grabbing the
+  screen directly, and on Wayland (GNOME, KDE Plasma, …) through the desktop's screen-sharing dialog.
+  Choose 720p or 1080p, 30 or 60 frames a second, and which screen. Uses the graphics card's H.264
+  encoder when x264 isn't available.
 - **Picks up where you left off.** Recent videos remember their position and their subtitles.
 - **Subtitles from the PC:** subtitle files next to the video and text subtitles inside it.
   Switch them or turn them off while the movie plays; on Samsung TVs this happens instantly.
@@ -14,11 +25,18 @@ pause, rewind and volume all work as usual.
   are audio only (speakers), and which can't play anything (router, phones, …)
 - **Skynet intro (fun mode):** a Skynet-style boot animation before the movie 🤖
 - **English and Slovak.** OpusCast follows the system language; `OPUSCAST_LANG=en` or `sk` overrides it.
-- Also a command-line version: `opuscast VIDEO`, `opuscast VIDEO --sub auto`, `opuscast --list`,
-  `opuscast --stop` (`opuscast --help` lists everything)
+- Also a command-line version: `opuscast VIDEO`, `opuscast VIDEO --sub auto`, `opuscast SONGS…`,
+  `opuscast PHOTOS… --every 8`, `opuscast --desktop`, `opuscast --list`, `opuscast --stop`
+  (`opuscast --help` lists everything)
 
-Tested with a Samsung QLED (Tizen). Most smart TVs that can play videos from the network
-(Samsung, LG, Sony, Philips, Hisense, Android TV with a DLNA app, …) should work.
+Tested with a Samsung QLED (Tizen). Other TVs with a DLNA player (LG, Sony, Philips, Hisense,
+Panasonic, Android TV sets) should work too: OpusCast reads which formats each TV lists and uses
+that TV's own names for them, retries when a TV is still busy, and seeks the way the TV accepts.
+
+- **Philips:** turn on *Digital Media Renderer – DMR* (All Settings → Wireless and Networks →
+  Wired or Wi-Fi). It's on from the factory, but if your TV isn't found, check it.
+- **Chromecast, Google TV streamers, Nvidia Shield** only speak Google Cast, not DLNA, so OpusCast
+  can't use them. An Android TV *set* (Sony, Philips, …) usually has DLNA as well.
 
 **Android:** there's an Android version too, in [android/](android/README.md).
 
@@ -42,8 +60,12 @@ The installer checks what's missing and prints the right command for your distro
 | Smooth 4K preview | `gstreamer1.0-plugins-bad` | `gst-plugin-va` | `gstreamer1-plugins-bad-free` |
 | Subtitles inside videos, non-SRT files | `ffmpeg` | `ffmpeg` | `ffmpeg-free` |
 | Skynet intro | `python3-cairo ffmpeg` | `python-cairo ffmpeg` | `python3-cairo ffmpeg-free` |
+| Cast the desktop | `ffmpeg` | `ffmpeg` | `ffmpeg-free` |
+| … on Wayland, also | `gir1.2-gstreamer-1.0 gstreamer1.0-pipewire` | `gst-plugin-pipewire` | `pipewire-gstreamer` |
 
-Works on X11 and Wayland, with any desktop (Cinnamon, KDE, GNOME, …).
+Works on X11 and Wayland, with any desktop (Cinnamon, KDE, GNOME, …). Casting the desktop on Wayland
+also needs the desktop's screen-sharing portal (`xdg-desktop-portal-kde` / `-gnome` / `-wlr`), which
+KDE, GNOME and Sway install already. The PC's sound comes from PipeWire or PulseAudio.
 
 ## Subtitles
 
@@ -77,13 +99,17 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=<
 ## Keys
 
 Space play/pause · ←/→ 10 s · Shift+←/→ 30 s · ↑/↓ TV volume · S subtitles on/off · P show on PC · Ctrl+O open
+· Ctrl+D cast the desktop · Page Up/Down previous/next song or photo · photos: ←/→ previous/next,
+Space slideshow on/off
 
 ## Notes
 
 - Keep OpusCast open while you watch. The TV reads the file from your PC as it plays.
 - The TV does the decoding, so what plays depends on the TV. Samsung TVs don't support
   Dolby Vision; such files may not play.
-- Settings: `~/.config/opuscast/`. The rendered intro and extracted subtitles: `~/.cache/opuscast/`.
+- Music and photos need OpusCast open too: it hands the TV one song or photo at a time.
+- Settings: `~/.config/opuscast/`. The rendered intro, extracted subtitles and songs converted to MP3
+  (kept under 1 GB): `~/.cache/opuscast/`.
 
 ## License
 

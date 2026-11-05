@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""OpusCast - play videos from this PC on your smart TV (GTK 3 app)."""
+"""OpusCast - play videos, music and photos from this PC on your smart TV, or show it the desktop
+(GTK 3 app)."""
 import os
 import queue
 import shutil
@@ -11,14 +12,17 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import opuscast_core as core  # noqa: E402
+import opuscast_desktop as desk  # noqa: E402
 import opuscast_intro as intro  # noqa: E402
+import opuscast_media as media  # noqa: E402
 from opuscast_i18n import _  # noqa: E402
 
 try:
     import gi
     gi.require_version("Gtk", "3.0")
     gi.require_version("Gdk", "3.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 except (ImportError, ValueError):
     sys.stderr.write(_("OpusCast needs PyGObject and GTK 3:") + f"\n  {core.install_hint(['gtk'])}\n")
     sys.exit(1)
@@ -46,7 +50,11 @@ CSS = b"""
 .badge-audio { color: #c88800; font-weight: bold; }
 .badge-no { opacity: 0.6; }
 .section-title { font-weight: bold; opacity: 0.8; }
+.live-badge { color: #e01b24; font-weight: bold; }
+.art { border-radius: 8px; }
 """
+SLIDE_SECONDS = (3, 5, 10, 20, 30)
+MODE_ICONS = {"music": "audio-x-generic", "photo": "image-x-generic", "desktop": "video-display"}
 
 
 def which(name):
@@ -239,7 +247,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.vol_timer, self.vol_touched, self.setting_vol = None, 0.0, False
         self.last_save, self.poll_errors, self.range_dur = 0.0, 0, None
         self.devices, self.scanning, self.scanned_at = [], False, 0.0
-        self.pending_play = None
+        self.pending_play = None  # (function, args) to run once a TV is found
+        self.mode, self.slideshow, self.slide_timer, self.pending_cast = None, False, None, None
         self.event_sids, self.last_caption_event, self.last_caption_cmd = {}, 0.0, 0.0
         self.events_pending = False  # a SUBSCRIBE is on its way
         self.worker = Worker(self._on_worker_error)
@@ -289,12 +298,12 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self.subtitle_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
             self.subtitle_label.get_style_context().add_class("dim-label")
             toolbar.pack_start(self.subtitle_label, True, True, 0)
-            open_btn = Gtk.Button(label=_("Open video"), always_show_image=True,
+            open_btn = Gtk.Button(label=_("Open"), always_show_image=True,
                                   image=Gtk.Image.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON))
             toolbar.pack_end(open_btn, False, False, 0)
             outer.pack_start(toolbar, False, False, 0)
             outer.pack_start(Gtk.Separator(), False, False, 0)
-        open_btn.set_tooltip_text(_("Choose a video (Ctrl+O)"))
+        open_btn.set_tooltip_text(_("Choose videos, music or photos (Ctrl+O)"))
         open_btn.connect("clicked", lambda *_a: self.choose_file())
         self._set_subtitle(_("Looking for your TV…"))
 
@@ -320,16 +329,32 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.dropzone.get_style_context().add_class("dropzone")
         icon = Gtk.Image.new_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
         icon.set_pixel_size(72)
-        title = Gtk.Label(label=_("Drop a video here"))
+        title = Gtk.Label(label=_("Drop videos, music or photos here"))
         title.get_style_context().add_class("big-title")
-        sub = Gtk.Label(label=_("It plays on your TV - control it with the TV remote or the buttons here."),
+        sub = Gtk.Label(label=_("They play on your TV - control them with the TV remote or the buttons here."),
                         wrap=True, justify=Gtk.Justification.CENTER)
         sub.get_style_context().add_class("dim-label")
-        btn = Gtk.Button(label=_("Choose Video…"), halign=Gtk.Align.CENTER)
+        buttons = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
+        btn = Gtk.Button(label=_("Choose…"))
+        btn.set_tooltip_text(_("Videos, music or photos - pick several songs or photos to play them one after another"))
         btn.get_style_context().add_class("suggested-action")
-        btn.set_size_request(220, 46)
+        btn.set_size_request(200, 46)
         btn.connect("clicked", lambda *_a: self.choose_file())
-        for w in (icon, title, sub, btn):
+        buttons.pack_start(btn, False, False, 0)
+        desk_box = Gtk.Box()
+        desk_box.get_style_context().add_class("linked")
+        desk_btn = Gtk.Button(label=_("Cast Desktop"), always_show_image=True,
+                              image=Gtk.Image.new_from_icon_name("video-display-symbolic", Gtk.IconSize.BUTTON))
+        desk_btn.set_tooltip_text(_("Show this PC's screen and sound on the TV (Ctrl+D)"))
+        desk_btn.set_size_request(-1, 46)
+        desk_btn.connect("clicked", lambda *_a: self.cast_desktop())
+        desk_opts = Gtk.MenuButton(tooltip_text=_("Desktop casting settings"))
+        desk_opts.add(Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON))
+        desk_opts.set_popover(self._build_desktop_popover())
+        desk_box.pack_start(desk_btn, False, False, 0)
+        desk_box.pack_start(desk_opts, False, False, 0)
+        buttons.pack_start(desk_box, False, False, 0)
+        for w in (icon, title, sub, buttons):
             self.dropzone.pack_start(w, False, False, 0)
         page.pack_start(self.dropzone, False, False, 0)
 
@@ -361,12 +386,16 @@ class OpusCastWindow(Gtk.ApplicationWindow):
 
         self.placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER,
                                    vexpand=True)
-        img = Gtk.Image.new_from_icon_name("video-display-symbolic", Gtk.IconSize.DIALOG)
-        img.set_pixel_size(96)
-        img.get_style_context().add_class("dim-label")
+        self.placeholder_icon = Gtk.Image.new_from_icon_name("video-display-symbolic", Gtk.IconSize.DIALOG)
+        self.placeholder_icon.set_pixel_size(96)
+        self.placeholder_icon.get_style_context().add_class("dim-label")
+        self.art = Gtk.Image()  # a song's cover or the photo on the TV
+        self.art.get_style_context().add_class("art")
+        self.art.set_no_show_all(True)
         self.placeholder_label = Gtk.Label()
         self.placeholder_label.get_style_context().add_class("dim-label")
-        self.placeholder.pack_start(img, False, False, 0)
+        self.placeholder.pack_start(self.placeholder_icon, False, False, 0)
+        self.placeholder.pack_start(self.art, False, False, 0)
         self.placeholder.pack_start(self.placeholder_label, False, False, 0)
         page.pack_start(self.placeholder, True, True, 0)
 
@@ -377,7 +406,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         page.pack_start(self.title_label, False, False, 0)
         page.pack_start(self.status_label, False, False, 0)
 
-        row = Gtk.Box(spacing=10)
+        row = self.slider_row = Gtk.Box(spacing=10)
         self.elapsed = Gtk.Label(label="0:00:00", width_chars=8)
         self.total = Gtk.Label(label="--:--", width_chars=8)
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
@@ -401,24 +430,73 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             b.connect("clicked", lambda *_a: callback())
             return b
 
+        self.play_icon, self.play_imgs = "media-playback-start-symbolic", []
+
+        def play_button(tip, callback):
+            b = Gtk.Button(tooltip_text=tip, valign=Gtk.Align.CENTER)
+            b.get_style_context().add_class("play-button")
+            b.get_style_context().add_class("suggested-action")
+            img = Gtk.Image.new_from_icon_name(self.play_icon, Gtk.IconSize.DND)
+            b.add(img)
+            b.connect("clicked", lambda *_a: callback())
+            return b, img
+
+        # the middle row changes with what's on: a video, songs, photos or the desktop
+        self.transport = Gtk.Stack(transition_type=Gtk.StackTransitionType.NONE, vhomogeneous=False)
         controls = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
         controls.pack_start(button("media-seek-backward-symbolic", _("30s"), _("Back 30 seconds (Shift+←)"),
                                    lambda: self.skip(-30)), False, False, 0)
         controls.pack_start(button("media-seek-backward-symbolic", _("10s"), _("Back 10 seconds (←)"),
                                    lambda: self.skip(-10)), False, False, 0)
-        self.play_btn = Gtk.Button(tooltip_text=_("Play / pause (Space)"), valign=Gtk.Align.CENTER)
-        self.play_btn.get_style_context().add_class("play-button")
-        self.play_btn.get_style_context().add_class("suggested-action")
-        self.play_icon = "media-playback-start-symbolic"
-        self.play_img = Gtk.Image.new_from_icon_name(self.play_icon, Gtk.IconSize.DND)
-        self.play_btn.add(self.play_img)
-        self.play_btn.connect("clicked", lambda *_a: self.toggle_play())
+        self.play_btn, img = play_button(_("Play / pause (Space)"), self.toggle_play)
+        self.play_imgs.append(img)
         controls.pack_start(self.play_btn, False, False, 6)
         controls.pack_start(button("media-seek-forward-symbolic", _("10s"), _("Forward 10 seconds (→)"),
                                    lambda: self.skip(10), True), False, False, 0)
         controls.pack_start(button("media-seek-forward-symbolic", _("30s"), _("Forward 30 seconds (Shift+→)"),
                                    lambda: self.skip(30), True), False, False, 0)
-        page.pack_start(controls, False, False, 0)
+        self.transport.add_named(controls, "video")
+
+        music = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        music.pack_start(button("media-skip-backward-symbolic", "", _("Previous song (Page Up)"),
+                                lambda: self.step(-1)), False, False, 0)
+        music.pack_start(button("media-seek-backward-symbolic", _("10s"), _("Back 10 seconds (←)"),
+                                lambda: self.skip(-10)), False, False, 0)
+        btn, img = play_button(_("Play / pause (Space)"), self.toggle_play)
+        self.play_imgs.append(img)
+        music.pack_start(btn, False, False, 6)
+        music.pack_start(button("media-seek-forward-symbolic", _("10s"), _("Forward 10 seconds (→)"),
+                                lambda: self.skip(10), True), False, False, 0)
+        music.pack_start(button("media-skip-forward-symbolic", "", _("Next song (Page Down)"),
+                                lambda: self.step(1), True), False, False, 0)
+        self.transport.add_named(music, "music")
+
+        photos = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        photos.pack_start(button("go-previous-symbolic", _("Previous"), _("Previous photo (←)"),
+                                 lambda: self.step(-1)), False, False, 0)
+        self.slide_btn, self.slide_img = play_button(_("Slideshow on / off (Space)"), self.toggle_slideshow)
+        photos.pack_start(self.slide_btn, False, False, 6)
+        photos.pack_start(button("go-next-symbolic", _("Next"), _("Next photo (→)"), lambda: self.step(1), True),
+                          False, False, 0)
+        self.slide_every = Gtk.ComboBoxText(valign=Gtk.Align.CENTER, tooltip_text=_("How long each photo stays"))
+        for secs in SLIDE_SECONDS:
+            self.slide_every.append(str(secs), _("{n} s each").format(n=secs))
+        self.slide_every.set_active_id(str(self.cfg.get("slide_seconds", 5)))
+        if self.slide_every.get_active() < 0:
+            self.slide_every.set_active_id("5")
+        self.slide_every.connect("changed", self._on_slide_every)
+        photos.pack_start(self.slide_every, False, False, 0)
+        self.transport.add_named(photos, "photo")
+
+        live = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        badge = Gtk.Label(label="● " + _("LIVE"))
+        badge.get_style_context().add_class("live-badge")
+        live.pack_start(badge, False, False, 0)
+        note = Gtk.Label(label=_("The TV shows the screen a second or two late."))
+        note.get_style_context().add_class("dim-label")
+        live.pack_start(note, False, False, 0)
+        self.transport.add_named(live, "live")
+        page.pack_start(self.transport, False, False, 0)
 
         controls2 = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
         controls2.pack_start(button("media-playback-stop-symbolic", _("Stop"), _("Stop playback"), self.stop),
@@ -442,6 +520,28 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.sub_button.set_no_show_all(True)
         self.sub_button.hide()
         controls2.pack_start(self.sub_button, False, False, 0)
+        self.tracks_button = Gtk.MenuButton(tooltip_text=_("All songs"), valign=Gtk.Align.CENTER)
+        self.tracks_button.set_size_request(-1, 44)
+        tracks_box = Gtk.Box(spacing=6)
+        tracks_box.pack_start(Gtk.Image.new_from_icon_name("view-list-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        self.tracks_label = Gtk.Label(label=_("Songs"))
+        tracks_box.pack_start(self.tracks_label, False, False, 0)
+        self.tracks_button.add(tracks_box)
+        self.tracks_popover = Gtk.Popover()
+        self.tracks_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.tracks_list.connect("row-activated", lambda _l, row: self._pick_track(row.index))
+        tracks_sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                       max_content_height=420, margin=6)
+        tracks_sw.set_size_request(380, -1)
+        tracks_sw.add(self.tracks_list)
+        tracks_sw.show_all()
+        self.tracks_popover.add(tracks_sw)
+        self.tracks_popover.connect("show", lambda *_a: self._fill_tracks())
+        self.tracks_button.set_popover(self.tracks_popover)
+        self.tracks_button.show_all()
+        self.tracks_button.set_no_show_all(True)
+        self.tracks_button.hide()
+        controls2.pack_start(self.tracks_button, False, False, 0)
         self.skip_intro_btn = button("go-next-symbolic", _("Skip intro"), _("Start the video now"), self.skip_intro, True)
         self.skip_intro_btn.show_all()
         self.skip_intro_btn.set_no_show_all(True)
@@ -586,9 +686,10 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self.clear_info()
         self._refresh_device_rows()
         self._subscribe_events(tv)
+        self.worker.submit(tv.sink)  # which formats it plays (and whether it's a speaker)
         if self.pending_play:
-            args, self.pending_play = self.pending_play, None
-            self.play_file(*args)
+            (fn, args), self.pending_play = self.pending_play, None
+            self.worker.submit(lambda: None, done=lambda _r: fn(*args))
 
     def _subscribe_events(self, tv):
         self.events_pending = True
@@ -736,7 +837,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                 using.pack_start(Gtk.Label(label=_("In use")), False, False, 0)
                 hb.pack_end(using, False, False, 0)
             elif d["can_play"]:
-                use = Gtk.Button(label=_("Use this TV"), valign=Gtk.Align.CENTER)
+                use = Gtk.Button(label=_("Use this speaker") if d["kind"] == "speaker" else _("Use this TV"),
+                                 valign=Gtk.Align.CENTER)
                 use.connect("clicked", lambda _b, dev=d: self._use_device(dev))
                 hb.pack_end(use, False, False, 0)
             row.add(hb)
@@ -833,27 +935,33 @@ class OpusCastWindow(Gtk.ApplicationWindow):
     # ------------------------------------------------------------ playback
 
     def choose_file(self):
-        dlg = Gtk.FileChooserNative.new(_("Choose a video to play on the TV"), self, Gtk.FileChooserAction.OPEN,
+        dlg = Gtk.FileChooserNative.new(_("Choose what to play on the TV"), self, Gtk.FileChooserAction.OPEN,
                                         _("_Play"), _("_Cancel"))
-        videos = Gtk.FileFilter()
-        videos.set_name(_("Videos"))
-        videos.add_mime_type("video/*")
-        for ext in core.VIDEO_EXTS:
-            videos.add_pattern("*" + ext)
-            videos.add_pattern("*" + ext.upper())
-        everything = Gtk.FileFilter()
-        everything.set_name(_("All files"))
-        everything.add_pattern("*")
-        dlg.add_filter(videos)
-        dlg.add_filter(everything)
+        dlg.set_select_multiple(True)
+
+        def add_filter(name, mimes, exts):
+            f = Gtk.FileFilter()
+            f.set_name(name)
+            for m in mimes:
+                f.add_mime_type(m)
+            for ext in exts:
+                f.add_pattern("*" + ext)
+                f.add_pattern("*" + ext.upper())
+            dlg.add_filter(f)
+        add_filter(_("Videos, music and photos"), ("video/*", "audio/*", "image/*"),
+                   core.VIDEO_EXTS + core.AUDIO_EXTS + core.IMAGE_EXTS)
+        add_filter(_("Videos"), ("video/*",), core.VIDEO_EXTS)
+        add_filter(_("Music"), ("audio/*",), core.AUDIO_EXTS)
+        add_filter(_("Photos"), ("image/*",), core.IMAGE_EXTS)
+        add_filter(_("All files"), (), ("",))
         start = self.cfg.get("last_dir") or GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS)
         if start and os.path.isdir(start):
             dlg.set_current_folder(start)
         response = dlg.run()
-        path = dlg.get_filename()
+        paths = dlg.get_filenames()
         dlg.destroy()
-        if response == Gtk.ResponseType.ACCEPT and path:
-            self.play_file(path)
+        if response == Gtk.ResponseType.ACCEPT and paths:
+            self.open_paths(paths)
 
     def _on_drop(self, _w, _ctx, _x, _y, data, _info, _time):
         self.dropzone.get_style_context().remove_class("hover")
@@ -867,20 +975,51 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         if subs and self.session and self.session["kind"] == "movie" and len(subs) == len(paths):
             self._use_sub_file(subs[0])  # a subtitle file dropped while a video plays
             return
-        for path in paths:
-            if os.path.isfile(path) and not path.lower().endswith(core.SUB_EXTS):
-                self.play_file(path)
-                return
-        self.show_info(_("That doesn't look like a video file on this PC."), WARNING)
+        self.open_paths([p for p in paths if not p.lower().endswith(core.SUB_EXTS)])
+
+    def open_paths(self, paths):
+        """Play what was chosen: the (first) video, the songs one after another, or the photos as a
+        slideshow - one photo brings the rest of its folder along, to flip through."""
+        kind, files = media.collect(paths)
+        if kind is None:
+            self.show_info(_("That doesn't look like a video, song or photo on this PC."), WARNING)
+            return
+        self.cfg["last_dir"] = os.path.dirname(files[0])
+        if kind == "video":
+            self.play_file(files[0])
+        elif kind == "audio":
+            self.play_music(files, 0)
+        elif len(files) == 1:
+            folder = media.folder_items(files[0], "image")
+            self.show_photos(folder, folder.index(files[0]) if files[0] in folder else 0)
+        else:
+            self.show_photos(files, 0)
+
+    def _ready_for(self, what, fn, args):
+        """True if the TV is there and can do this; otherwise say why (or wait for the TV)."""
+        if not self.tv:
+            self.pending_play = (fn, args)
+            self.show_info(_("Waiting for the TV - it starts as soon as the TV is found."))
+            return False
+        if what != "audio" and self._is_speaker():
+            self.show_info(_("{device} plays music only - choose a TV for videos, photos and the desktop.").format(
+                device=self.tv.name), WARNING, [(_("Show devices"), lambda: self.dev_button.set_active(True))])
+            return False
+        return True
+
+    def _is_speaker(self):
+        sink = self.tv.cached_sink() if self.tv else None
+        return bool(sink) and "*" not in sink and not any(m.startswith("video/") for m in sink)
 
     def play_file(self, path, start_at=None):
         path = os.path.abspath(path)
         if not os.path.isfile(path):
             self.show_info(_("File not found: {path}").format(path=path), WARNING)
             return
-        if not self.tv:
-            self.pending_play = (path, start_at)
-            self.show_info(_("Waiting for the TV - the video starts as soon as it's found."))
+        if core.media_kind(path) in ("audio", "image"):
+            self.open_paths([path])
+            return
+        if not self._ready_for("video", self.play_file, (path, start_at)):
             return
         self.cfg["last_dir"] = os.path.dirname(path)
         item = self._recent_item(path)
@@ -951,15 +1090,19 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self._start_session("movie", path, start_at, subtitle=subtitle, subs_on=bool(subtitle), subs=subs)
         return False
 
-    def _start_session(self, kind, path, start_at, next_up=None, subtitle=None, subs_on=False, subs=None):
+    def _start_session(self, kind, path, start_at, next_up=None, subtitle=None, subs_on=False, subs=None,
+                       media=None, title=None, **extra):
+        """Start something on the TV. kind: movie, intro, music (one song of a queue), photo (one photo
+        of a slideshow) or desktop; media is already published for all but videos."""
         self.gen += 1
         entry, data = subtitle if subtitle else (None, None)
-        try:
-            media = self.server.publish(path, data)
-        except OSError as e:
-            self.show_info(_("Can't read that file: {error}").format(error=e), ERROR)
-            self.stack.set_visible_child_name("pick")
-            return
+        if media is None:
+            try:
+                media = self.server.publish(path, data)
+            except OSError as e:
+                self.show_info(_("Can't read that file: {error}").format(error=e), ERROR)
+                self.stack.set_visible_child_name("pick")
+                return
         now = time.monotonic()
         self.session = {"kind": kind, "path": path, "media": media, "next": next_up, "seen_playing": False,
                         "started": now, "gen": self.gen, "subs": subs, "sub_entry": entry, "sub_on": False,
@@ -969,15 +1112,18 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                         # starting it failed, but the TV may still play it: a Samsung asks "Allow this
                         # device?" the first time, holds the commands meanwhile and carries them out once allowed
                         "start_error": None, "start_failed": 0.0, "answering_since": 0.0, "retried": False,
-                        "wait_bar": None}
+                        "wait_bar": None, "queue": None, "index": 0, "cast": None, "tags": {}}
+        self.session.update(extra)
+        # the URLs of this song/photo and the one before: while switching, the TV may still report the old one
+        self.session["ours"] = (list(extra.get("ours") or []) + [media["url_path"]])[-3:]
         self.poller.active = True
         self.tv_state, self.tv_pos, self.tv_pos_raw, self.pos_seen, self.tv_dur = "TRANSITIONING", float(start_at), None, now, 0.0
         self.hold = (float(start_at), now, 30.0) if start_at else None
         self.range_dur = None
-        self._show_player(_("Skynet is booting…") if kind == "intro" else media["title"], _("Starting on the TV…"))
-        self.skip_intro_btn.set_visible(kind == "intro")
-        self.sub_button.set_visible(kind == "movie")
-        if self.preview_switch.get_active():
+        self._set_mode(kind)
+        self._show_player(title or (_("Skynet is booting…") if kind == "intro" else media["title"]),
+                          _("Starting on the TV…"))
+        if self.preview_switch.get_active() and kind in ("movie", "intro"):
             self._preview_load()
         gen = self.gen
         if subs_on:
@@ -1035,10 +1181,12 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self._update_status()
             return
         s["start_error"], s["start_failed"], s["answering_since"] = error, time.monotonic(), 0.0
-        s["wait_bar"] = self.show_info(
-            _("The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
-              "choose Allow - the video then starts by itself.").format(error=error), WARNING,
-            [(_("Try again"), self._retry_start), (_("Stop"), self.stop)])
+        text = _("The TV hasn't taken the video yet ({error}). If the TV asks whether to allow this PC, "
+                 "choose Allow - the video then starts by itself.") if s["kind"] in ("movie", "intro") else \
+            _("The TV hasn't taken it yet ({error}). If the TV asks whether to allow this PC, choose Allow - "
+              "it then starts by itself.")
+        s["wait_bar"] = self.show_info(text.format(error=error), WARNING,
+                                       [(_("Try again"), self._retry_start), (_("Stop"), self.stop)])
         GLib.timeout_add_seconds(120, self._give_up, s["gen"], s["start_failed"])
         self._update_sub_button()
         self._update_status()
@@ -1063,7 +1211,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                 and s["start_failed"] == stamp):
             error = s["start_error"]
             self._end_session(stop_tv=False)
-            self.show_info(_("Couldn't start the video on the TV: {error}").format(error=error), ERROR)
+            self.show_info(_("Couldn't start it on the TV: {error}").format(error=error), ERROR)
         return False
 
     @staticmethod
@@ -1128,7 +1276,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             commands = [f"sudo ufw allow from {host} to any port {port} proto tcp"]
         actions = [(_("Allow it (asks for your password)"), lambda: self._run_root(fixes[0]))] \
             if fixes and which("pkexec") else []
-        self.show_info(_("The TV hasn't started loading the video. A firewall on this PC may be blocking it. "
+        self.show_info(_("The TV hasn't started loading it. A firewall on this PC may be blocking it. "
                          "This lets the TV in:"), WARNING, actions, selectable="\n".join(commands))
 
     def _run_root(self, cmd):
@@ -1143,8 +1291,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
     def _root_done(self, ok):
         s = self.session
         if ok and s:
-            self.show_info(_("Firewall updated - starting the video again."))
-            self.play_file(s["path"], self.est_pos() if s["kind"] == "movie" else None)
+            self.show_info(_("Firewall updated - starting again."))
+            self._restart_current(s)
         elif ok:
             self.show_info(_("Firewall updated."))
         else:
@@ -1180,11 +1328,14 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         if not s:
             return False
         state, pos, dur, uri = r["state"], r["pos"], r["dur"], r["uri"]
-        ours = not uri or s["media"]["url_path"] in uri
+        current = not uri or s["media"]["url_path"] in uri
+        ours = current or any(p in uri for p in s["ours"])
         now = time.monotonic()
         was_seen = s["seen_playing"]
-        if ours:
-            if state == "PLAYING":
+        photo = s["kind"] == "photo"
+        if current:
+            # a photo counts as shown once the TV fetched it: some TVs report STOPPED while showing one
+            if state == "PLAYING" or (photo and s["media"]["requested"].is_set() and state != "TRANSITIONING"):
                 s["seen_playing"] = True
             if s["seen_playing"] and state in ("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"):
                 if pos is not None:
@@ -1196,10 +1347,17 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                 self.tv_state = state
         if self.hold:
             target, since, limit = self.hold
-            arrived = ours and pos is not None and s["seen_playing"] and target - 2 <= pos <= target + 8
+            arrived = current and pos is not None and s["seen_playing"] and target - 2 <= pos <= target + 8
             if arrived or now - since > limit:
                 self.hold = None
-        if s["seen_playing"] and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours):
+        if photo:
+            finished = s["seen_playing"] and bool(uri) and not ours  # something else is on the TV now
+        else:
+            finished = s["seen_playing"] and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours)
+        if finished:
+            # a song that stopped at its end: the next one (stopped half-way: the TV's Stop button)
+            length = self.tv_dur or s["tags"].get("duration") or 0
+            s["ended"] = ours and (not length or self.tv_pos >= length - 5)
             self._session_finished()
             return False
         if not was_seen and s["seen_playing"] and s["start_error"] is not None:
@@ -1210,11 +1368,14 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                 s["answering_since"] = now
             if not s["retried"] and now - s["answering_since"] >= 4:
                 self._retry_start()
-        if (not s["seen_playing"] and s["start_error"] is None and now - s["started"] > 40
+        if (not s["seen_playing"] and s["start_error"] is None and now - s["started"] > 40 and not photo
                 and state in ("STOPPED", "NO_MEDIA_PRESENT")):
+            kind = s["kind"]
             self._end_session(stop_tv=False)
-            self.show_info(_("The TV didn't start the video. It may not support this file's format "
-                             "(Dolby Vision files often don't work on Samsung TVs)."), ERROR)
+            self.show_info({"music": _("The TV didn't start the song. It may not play this format."),
+                            "desktop": _("The TV didn't start showing the desktop.")}.get(kind, _(
+                                "The TV didn't start the video. It may not support this file's format "
+                                "(Dolby Vision files often don't work on Samsung TVs).")), ERROR)
             return False
         self._update_status()
         self._sync_preview()
@@ -1233,15 +1394,25 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             text = _("Waiting for the TV…")
         if s.get("sub_loading"):
             text = _("Loading subtitles…")
-        self._set_text(self.status_label, f"{text} - {self.tv.name}" if self.tv else text)
+        if s["kind"] == "photo" and s["start_error"] is None:
+            text = _("On the TV") if s["seen_playing"] else _("Sending the photo…")
+        line = f"{text} - {self.tv.name}" if self.tv else text
+        if s["kind"] == "music":
+            line = " · ".join(x for x in (media.song_line(s["tags"]), line) if x)
+        elif s["kind"] == "photo":
+            line = f"{s['index'] + 1} / {len(s['queue'])}  ·  {line}"
+        elif s["kind"] == "desktop" and s["cast"]:
+            line = f"{s['cast'].describe()}  ·  {line}"
+        self._set_text(self.status_label, line)
         icon = "media-playback-pause-symbolic" if st == "PLAYING" else "media-playback-start-symbolic"
         if icon != self.play_icon:
             self.play_icon = icon
-            self.play_img.set_from_icon_name(icon, Gtk.IconSize.DND)
+            for img in self.play_imgs:
+                img.set_from_icon_name(icon, Gtk.IconSize.DND)
 
     def _tick(self):
         s = self.session
-        if s and not self.dragging:
+        if s and not self.dragging and s["kind"] not in ("photo", "desktop"):
             pos = self.est_pos()
             if self.tv_dur and self.tv_dur != self.range_dur:
                 self.range_dur = self.tv_dur
@@ -1262,6 +1433,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             path, start_at, subtitle, subs = s["next"]
             self.session = None
             self._start_session("movie", path, start_at, subtitle=subtitle, subs_on=bool(subtitle), subs=subs)
+        elif s["kind"] == "music" and s.get("ended") and s["index"] + 1 < len(s["queue"]):
+            self._go_track(s["queue"], s["index"] + 1)
         else:
             self._end_session(stop_tv=False)
 
@@ -1277,11 +1450,17 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self._remember(s["path"], pos=0 if watched else pos, dur=dur, watched=watched)
         if stop_tv and self.tv:
             self.worker.submit(self.tv.stop)
+        if s["cast"]:
+            threading.Thread(target=s["cast"].stop, daemon=True).start()
+        self._cancel_slide()
         self.preview.unload()
         self.hold = None
         self.skip_intro_btn.hide()
         self.sub_button.hide()
+        self.tracks_button.hide()
         self.sub_popover.popdown()
+        self.tracks_popover.popdown()
+        self._set_art(None)
         self.stack.set_visible_child_name("pick")
         self._update_video_area()
         self._refresh_recent()
@@ -1289,6 +1468,11 @@ class OpusCastWindow(Gtk.ApplicationWindow):
     def toggle_play(self):
         if not (self.session and self.tv):
             return
+        if self.session["kind"] == "photo":
+            self.toggle_slideshow()
+            return
+        if self.session["kind"] == "desktop":
+            return  # a live picture: pausing would only make it fall behind
         if self.tv_state == "PLAYING":
             self.tv_pos, self.tv_state = self.est_pos(), "PAUSED_PLAYBACK"
             self.worker.submit(self.tv.pause, done=lambda _r: self.poller.wake.set())
@@ -1317,11 +1501,415 @@ class OpusCastWindow(Gtk.ApplicationWindow):
             self._session_finished()
 
     def stop(self):
-        if not self.session:  # still preparing (subtitles / intro): just go back
+        if not self.session:  # still preparing (subtitles / intro / a song / the desktop): just go back
             self.gen += 1
+            if self.pending_cast:
+                cast, self.pending_cast = self.pending_cast, None
+                threading.Thread(target=cast.stop, daemon=True).start()
             self.stack.set_visible_child_name("pick")
             return
         self._end_session(stop_tv=True)
+
+    # ------------------------------------------------------------ music, photos, the desktop
+
+    def _set_mode(self, kind):
+        """Show the controls for what's on: a video (or the intro), songs, photos or the desktop."""
+        self.mode = kind
+        self.transport.set_visible_child_name({"music": "music", "photo": "photo", "desktop": "live"}.get(kind, "video"))
+        self.slider_row.set_visible(kind not in ("photo", "desktop"))
+        self.skip_intro_btn.set_visible(kind == "intro")
+        self.sub_button.set_visible(kind == "movie")
+        self.tracks_button.set_visible(kind == "music")
+        self.volume.set_visible(kind != "photo")
+        self.placeholder_icon.set_from_icon_name(MODE_ICONS.get(kind, "video-display-symbolic"), Gtk.IconSize.DIALOG)
+        self.placeholder_icon.set_pixel_size(96)
+        if kind not in ("music", "photo"):
+            self._set_art(None)
+        self._update_slide_button()
+
+    def _set_art(self, pixbuf):
+        if pixbuf is None:
+            self.art.clear()
+        else:
+            self.art.set_from_pixbuf(pixbuf)
+        self.art.set_visible(pixbuf is not None)
+        self.placeholder_icon.set_visible(pixbuf is None)
+
+    @staticmethod
+    def _pixbuf(path=None, data=None, box=(640, 400)):
+        """A picture fitted into box and turned upright, or None. Fine to call off the GUI thread."""
+        try:
+            if data is not None:
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pb = loader.get_pixbuf()
+            else:  # decoded small straight away: a 50-megapixel photo stays quick
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, box[0] * 2, box[1] * 2, True)
+            pb = pb.apply_embedded_orientation() or pb
+            scale = min(1.0, box[0] / pb.get_width(), box[1] / pb.get_height())
+            if scale < 1.0:
+                pb = pb.scale_simple(max(1, round(pb.get_width() * scale)), max(1, round(pb.get_height() * scale)),
+                                     GdkPixbuf.InterpType.BILINEAR)
+            return pb
+        except (GLib.Error, TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def step(self, delta):
+        """Next / previous photo or song."""
+        s = self.session
+        if not s or not s["queue"]:
+            return
+        n = len(s["queue"])
+        if s["kind"] == "photo" and n > 1:
+            self._go_photo(s["queue"], (s["index"] + delta) % n)
+        elif s["kind"] == "music":
+            if delta < 0 and self.est_pos() > 5:
+                self.seek_to(0)  # like music players: "previous" first goes back to the start of the song
+                return
+            i = s["index"] + delta
+            if 0 <= i < n:
+                self._go_track(s["queue"], i)
+
+    def _restart_current(self, s):
+        if s["kind"] == "music":
+            self._go_track(s["queue"], s["index"])
+        elif s["kind"] == "photo":
+            self._go_photo(s["queue"], s["index"])
+        elif s["kind"] == "desktop":
+            self._end_session(stop_tv=False)
+            self.cast_desktop()
+        elif s["kind"] == "intro" and s["next"]:
+            self.play_file(s["next"][0], s["next"][1])
+        else:
+            self.play_file(s["path"], self.est_pos())
+
+    # music
+
+    def play_music(self, files, index=0):
+        if not files or not self._ready_for("audio", self.play_music, (files, index)):
+            return
+        if self.session:
+            self._end_session(stop_tv=False)
+        self.clear_info()
+        self._go_track(files, index)
+
+    def _go_track(self, files, index):
+        path, tv = files[index], self.tv
+        self.gen += 1
+        gen = self.gen
+        if not (self.session and self.session["kind"] == "music"):
+            self._set_mode("music")
+        self._show_player(os.path.splitext(os.path.basename(path))[0], _("Starting on the TV…"))
+
+        def work():
+            tags = media.audio_tags(path)
+            cover = media.song_cover(path, tags)
+            art = self._pixbuf(data=cover[1], box=(280, 280)) if cover else None
+            play, mime = path, None
+            if media.needs_mp3(tv, core.mime_of(path, "audio")):  # the TV doesn't list this format
+                GLib.idle_add(self._status_if, gen, _("Converting the song for the TV…"))
+                try:
+                    play, mime = media.to_mp3(path), "audio/mpeg"
+                except (core.TVError, OSError) as e:
+                    GLib.idle_add(self._track_failed, gen, files, index, str(e))
+                    return
+            GLib.idle_add(self._track_ready, gen, files, index, play, mime, tags, cover, art)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _status_if(self, gen, text):
+        if gen == self.gen:
+            self._set_text(self.status_label, text)
+        return False
+
+    def _track_ready(self, gen, files, index, play, mime, tags, cover, art):
+        if gen != self.gen:
+            return False
+        prev = self.session
+        meta = {k: tags[k] for k in ("artist", "albumartist", "album", "track", "duration") if tags.get(k)}
+        try:
+            m = self.server.publish(play, kind="audio", mime=mime, title=tags.get("title"), meta=meta)
+        except OSError as e:
+            return self._track_failed(gen, files, index, str(e))
+        if cover:
+            m["meta"]["cover_path"], m["meta"]["cover_mime"] = self.server.add_extra(m, *cover), cover[0]
+        ours = prev["ours"] if prev and prev["kind"] == "music" else []
+        self._start_session("music", files[index], 0, media=m, title=tags.get("title"), queue=files, index=index,
+                            tags=tags, ours=ours)
+        self._set_art(art)
+        self.tracks_label.set_text(f"{index + 1} / {len(files)}")
+        self._update_status()
+        if index + 1 < len(files):  # have the next song ready (converted, if this TV needs that)
+            nxt, tv = files[index + 1], self.tv
+
+            def prepare_next():
+                if media.needs_mp3(tv, core.mime_of(nxt, "audio")):
+                    media.to_mp3(nxt)
+            threading.Thread(target=self._quietly, args=(prepare_next,), daemon=True).start()
+        return False
+
+    def _track_failed(self, gen, files, index, error):
+        if gen != self.gen:
+            return False
+        self.show_info(_("Can't play {name}: {error}").format(name=os.path.basename(files[index]), error=error),
+                       WARNING)
+        if index + 1 < len(files):
+            self._go_track(files, index + 1)
+        elif self.session:
+            self._end_session(stop_tv=False)
+        else:
+            self.stack.set_visible_child_name("pick")
+        return False
+
+    def _fill_tracks(self):
+        for child in self.tracks_list.get_children():
+            child.destroy()
+        s = self.session
+        if not s or not s["queue"]:
+            return
+        for i, path in enumerate(s["queue"]):
+            row = Gtk.ListBoxRow()
+            row.index = i
+            name = os.path.splitext(os.path.basename(path))[0]
+            label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, margin=6)
+            text = GLib.markup_escape_text(("▶  " if i == s["index"] else f"{i + 1}.  ") + name)
+            label.set_markup(f"<b>{text}</b>" if i == s["index"] else text)
+            row.add(label)
+            self.tracks_list.add(row)
+        self.tracks_list.show_all()
+
+    def _pick_track(self, index):
+        self.tracks_popover.popdown()
+        s = self.session
+        if s and s["kind"] == "music" and s["queue"]:
+            self._go_track(s["queue"], index)
+
+    # photos
+
+    def show_photos(self, files, index=0):
+        if not files or not self._ready_for("image", self.show_photos, (files, index)):
+            return
+        if self.session:
+            self._end_session(stop_tv=False)
+        self.clear_info()
+        self._go_photo(files, index)
+
+    def _go_photo(self, files, index):
+        path, tv = files[index], self.tv
+        self.gen += 1
+        gen = self.gen
+        self._cancel_slide()
+        if not (self.session and self.session["kind"] == "photo"):
+            self._set_mode("photo")
+            self._show_player(os.path.basename(path), _("Preparing the photo…"))
+
+        def work():
+            try:
+                prep = media.prepare_photo(path, tv)
+            except OSError as e:
+                GLib.idle_add(self._photo_failed, gen, str(e))
+                return
+            shown = self._pixbuf(path=prep.get("file"), data=prep.get("data"))
+            GLib.idle_add(self._photo_ready, gen, files, index, prep, shown)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _photo_ready(self, gen, files, index, prep, shown):
+        if gen != self.gen:
+            return False
+        prev, path = self.session, files[index]
+        m = self.server.publish(path, kind="image", data=prep.get("data"), mime=prep["mime"],
+                                features=prep["features"],
+                                meta={"resolution": f"{prep['w']}x{prep['h']}"} if prep["w"] else None)
+        ours = prev["ours"] if prev and prev["kind"] == "photo" else []
+        self._start_session("photo", path, 0, media=m, title=os.path.basename(path), queue=files, index=index,
+                            ours=ours)
+        self._set_art(shown)
+        self._update_status()
+        if self.slideshow:
+            self._schedule_slide()
+        tv = self.tv
+        for j in {(index + 1) % len(files), (index - 1) % len(files)} - {index}:  # the neighbours, for a quick click
+            threading.Thread(target=self._quietly, args=(media.prepare_photo, files[j], tv), daemon=True).start()
+        return False
+
+    def _photo_failed(self, gen, error):
+        if gen != self.gen:
+            return False
+        self.show_info(_("Can't read that photo: {error}").format(error=error), WARNING)
+        if not self.session:
+            self.stack.set_visible_child_name("pick")
+        elif self.slideshow:
+            self._schedule_slide()
+        return False
+
+    def toggle_slideshow(self):
+        self.slideshow = not self.slideshow
+        self._update_slide_button()
+        if self.slideshow:
+            self._schedule_slide()
+        else:
+            self._cancel_slide()
+
+    def _update_slide_button(self):
+        icon = "media-playback-pause-symbolic" if self.slideshow else "media-playback-start-symbolic"
+        self.slide_img.set_from_icon_name(icon, Gtk.IconSize.DND)
+
+    def _schedule_slide(self):
+        self._cancel_slide()
+        s = self.session
+        if s and s["kind"] == "photo":
+            self.slide_timer = GLib.timeout_add_seconds(int(self.slide_every.get_active_id() or 5), self._slide_due,
+                                                        s["gen"])
+
+    def _cancel_slide(self):
+        if self.slide_timer:
+            GLib.source_remove(self.slide_timer)
+            self.slide_timer = None
+
+    def _slide_due(self, gen):
+        self.slide_timer = None
+        s = self.session
+        if s and s["kind"] == "photo" and s["gen"] == gen and self.slideshow:
+            self.step(1)
+        return False
+
+    def _on_slide_every(self, combo):
+        self.cfg["slide_seconds"] = int(combo.get_active_id() or 5)
+        self._save()
+        if self.slideshow:
+            self._schedule_slide()
+
+    # the desktop
+
+    def _build_desktop_popover(self):
+        pop = Gtk.Popover()
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=14)
+        rows = []
+
+        def combo(key, choices, default):
+            c = Gtk.ComboBoxText()
+            for value, text in choices:
+                c.append(str(value), text)
+            if not c.set_active_id(str(self.cfg.get(key, default))):
+                c.set_active_id(str(default))
+            c.connect("changed", lambda w: w.get_active_id() and self._desk_set(key, int(w.get_active_id())))
+            return c
+        self.desk_screen = Gtk.ComboBoxText()
+        self.desk_screen.connect("changed", lambda w: w.get_active_id() not in (None, "ask")
+                                 and self._desk_set("desk_screen", w.get_active_id()))
+        rows.append((_("Screen"), self.desk_screen))
+        rows.append((_("Picture"), combo("desk_height", [(1080, _("1080p - sharpest")),
+                                                        (720, _("720p - lighter on the PC and Wi-Fi"))], 1080)))
+        rows.append((_("Smoothness"), combo("desk_fps", [(30, _("30 pictures a second")),
+                                                       (60, _("60 pictures a second - needs a fast PC"))], 30)))
+        sound = Gtk.Switch(active=bool(self.cfg.get("desk_sound", True)), halign=Gtk.Align.START)
+        sound.connect("notify::active", lambda w, _p: self._desk_set("desk_sound", w.get_active()))
+        rows.append((_("Sound from this PC"), sound))
+        for i, (text, widget) in enumerate(rows):
+            grid.attach(Gtk.Label(label=text, xalign=0), 0, i, 1, 1)
+            grid.attach(widget, 1, i, 1, 1)
+        note = Gtk.Label(label=_("The TV shows the screen a second or two late - fine for slides, photos and "
+                                 "videos, not for games."), wrap=True, max_width_chars=46, xalign=0)
+        note.get_style_context().add_class("dim-label")
+        grid.attach(note, 0, len(rows), 2, 1)
+        grid.show_all()
+        pop.add(grid)
+        pop.connect("show", lambda *_a: self._fill_desk_screens())
+        return pop
+
+    def _desk_set(self, key, value):
+        self.cfg[key] = value
+        self._save()
+
+    def _fill_desk_screens(self):
+        c = self.desk_screen
+        c.remove_all()
+        if desk.session_kind() == "wayland":  # the desktop itself asks which screen or window
+            c.append("ask", _("Asked when you start"))
+            c.set_active_id("ask")
+            c.set_sensitive(False)
+            return
+        c.set_sensitive(True)
+        c.append("here", _("The one with this window"))
+        display = Gdk.Display.get_default()
+        for i in range(display.get_n_monitors()):
+            mon = display.get_monitor(i)
+            g, sc = mon.get_geometry(), mon.get_scale_factor()
+            c.append(str(i), f"{mon.get_model() or _('Screen {n}').format(n=i + 1)} ({g.width * sc}×{g.height * sc})")
+        if display.get_n_monitors() > 1:
+            c.append("all", _("All screens"))
+        if not c.set_active_id(str(self.cfg.get("desk_screen", "here"))):
+            c.set_active_id("here")
+
+    def _cast_area(self):
+        """X11: (x, y, width, height) of the screen to cast, in real pixels; None for all screens."""
+        display = Gdk.Display.get_default()
+        choice = str(self.cfg.get("desk_screen", "here"))
+        if choice == "all":
+            return None
+        mon = display.get_monitor(int(choice)) if choice.isdigit() and int(choice) < display.get_n_monitors() else None
+        if mon is None:
+            win = self.get_window()
+            mon = (display.get_monitor_at_window(win) if win else None) or display.get_primary_monitor() \
+                or display.get_monitor(0)
+        if mon is None:
+            return None
+        g, sc = mon.get_geometry(), mon.get_scale_factor()
+        return g.x * sc, g.y * sc, g.width * sc, g.height * sc
+
+    def cast_desktop(self):
+        if not self._ready_for("desktop", self.cast_desktop, ()):
+            return
+        need = desk.missing()
+        if need:
+            self.show_info(_("Casting the desktop needs a little more software. Install it with:"), WARNING,
+                           selectable=core.install_hint(need))
+            return
+        if self.session:
+            self._end_session(stop_tv=False)
+        if self.pending_cast:
+            old, self.pending_cast = self.pending_cast, None
+            threading.Thread(target=old.stop, daemon=True).start()
+        self.clear_info()
+        self.gen += 1
+        gen = self.gen
+        wayland = desk.session_kind() == "wayland"
+        self._set_mode("desktop")
+        self._show_player(_("Your desktop"), _("Choose what to show in the window that opens…") if wayland
+                          else _("Starting the screen capture…"))
+        cast = desk.DesktopCast(height=int(self.cfg.get("desk_height", 1080)), fps=int(self.cfg.get("desk_fps", 30)),
+                                sound=bool(self.cfg.get("desk_sound", True)),
+                                area=None if wayland else self._cast_area(),
+                                restore_token=self.cfg.get("portal_token"))
+        cast.on_end = lambda msg: GLib.idle_add(self._cast_ended, cast, msg)
+        self.pending_cast = cast
+        cast.start(lambda err: GLib.idle_add(self._cast_started, gen, cast, err))
+
+    def _cast_started(self, gen, cast, err):
+        if cast is not self.pending_cast or gen != self.gen:
+            threading.Thread(target=cast.stop, daemon=True).start()
+            return False
+        self.pending_cast = None
+        if err:
+            self.stack.set_visible_child_name("pick")
+            self.show_info(_("Couldn't cast the desktop: {error}").format(error=err), ERROR)
+            return False
+        if cast.restore_token and cast.restore_token != self.cfg.get("portal_token"):
+            self.cfg["portal_token"] = cast.restore_token  # next time the desktop shares without asking
+            self._save()
+        m = self.server.publish(live=cast.live, title=_("Desktop"))
+        self._start_session("desktop", None, 0, media=m, title=_("Your desktop"), cast=cast)
+        if self.cfg.get("desk_sound", True) and not cast.sound:
+            self.show_info(_("The PC's sound isn't going to the TV: there's no sound server to record it from."),
+                           WARNING)
+        return False
+
+    def _cast_ended(self, cast, message):
+        s = self.session
+        if s and s["cast"] is cast:
+            self._end_session(stop_tv=True)
+            self.show_info(_("Desktop casting stopped: {error}").format(error=message), WARNING)
+        return False
 
     # ------------------------------------------------------------ subtitles
 
@@ -1605,7 +2193,8 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         self._update_video_area()
 
     def _update_video_area(self):
-        show = bool(self.session) and self.preview_switch.get_active() and self.preview.ok
+        show = (bool(self.session) and self.session["kind"] in ("movie", "intro") and self.preview_switch.get_active()
+                and self.preview.ok)
         self.video_box.set_visible(show)
         self.placeholder.set_visible(not show)
         if show:
@@ -1616,7 +2205,7 @@ class OpusCastWindow(Gtk.ApplicationWindow):
 
     def _preview_load(self):
         self._update_video_area()
-        if self.session and self.preview.ok:
+        if self.session and self.session["kind"] in ("movie", "intro") and self.preview.ok:
             GLib.idle_add(self._preview_load_now, self.session["gen"])
 
     def _preview_load_now(self, gen):
@@ -1682,9 +2271,11 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         if s and s.get("sub_loading"):
             s["sub_loading"] = False
             self._update_sub_button()
-        if s and not s["seen_playing"]:
+        if s and s["kind"] == "photo" and s["index"]:
+            self.show_info(_("The TV didn't take this photo: {error}").format(error=error), WARNING)
+        elif s and not s["seen_playing"]:
             self._end_session(stop_tv=False)
-            self.show_info(_("Couldn't start the video on the TV: {error}").format(error=error), ERROR)
+            self.show_info(_("Couldn't start it on the TV: {error}").format(error=error), ERROR)
         else:
             self.show_info(_("The TV didn't accept that: {error}").format(error=error), WARNING)
         return False
@@ -1696,7 +2287,22 @@ class OpusCastWindow(Gtk.ApplicationWindow):
         if ctrl and k in (Gdk.KEY_o, Gdk.KEY_O):
             self.choose_file()
             return True
-        if not self.session or ctrl or self.dev_button.get_active() or self.sub_button.get_active():
+        if ctrl and k in (Gdk.KEY_d, Gdk.KEY_D):
+            self.cast_desktop()
+            return True
+        if (not self.session or ctrl or self.dev_button.get_active() or self.sub_button.get_active()
+                or self.tracks_button.get_active()):
+            return False
+        kind = self.session["kind"]
+        if kind in ("music", "photo") and k in (Gdk.KEY_Page_Up, Gdk.KEY_Page_Down):
+            self.step(1 if k == Gdk.KEY_Page_Down else -1)
+            return True
+        if kind == "photo" and k in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.step(1 if k == Gdk.KEY_Right else -1)
+            return True
+        if kind == "desktop" and k in (Gdk.KEY_Left, Gdk.KEY_Right, Gdk.KEY_space):
+            return False
+        if kind != "movie" and k in (Gdk.KEY_p, Gdk.KEY_P, Gdk.KEY_s, Gdk.KEY_S):
             return False
         if k == Gdk.KEY_space:
             self.toggle_play()
@@ -1728,8 +2334,11 @@ class OpusCastWindow(Gtk.ApplicationWindow):
                 self._quietly(tv.stop, timeout=2.5)
             for service, sid in sids.items():
                 tv.unsubscribe(service, sid)
+        cast = s["cast"] if s else self.pending_cast
         if s:
             self._end_session(stop_tv=False)
+        if cast:
+            cast.stop()
         if tv:
             t = threading.Thread(target=shutdown, daemon=True)
             t.start()
@@ -1759,11 +2368,9 @@ class OpusCastApp(Gtk.Application):
 
     def do_open(self, files, _n_files, _hint):
         self.do_activate()
-        for f in files:
-            path = f.get_path()
-            if path and self.win:
-                self.win.play_file(path)
-                break
+        paths = [f.get_path() for f in files if f.get_path()]
+        if paths and self.win:
+            self.win.open_paths(paths)
 
 
 def main():
