@@ -20,9 +20,17 @@ jobs:
   intro:
     name: Skynet intro (rendered once)
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y -q python3-cairo ffmpeg
+      - name: pycairo and ffmpeg
+        run: |
+          # The runner's package mirror sometimes stalls for a long time: each try is cut off after 15 minutes.
+          for try in 1 2; do
+            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q python3-cairo ffmpeg && exit 0
+            echo "::warning::apt-get didn't finish, trying again"; sudo dpkg --configure -a || true
+          done
+          exit 1
       - name: Render
         run: |
           mkdir -p build-extra
@@ -37,9 +45,17 @@ jobs:
   linux:
     name: Linux command line against a fake TV
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg xvfb
+      - name: ffmpeg and a virtual screen
+        run: |
+          # The runner's package mirror sometimes stalls for a long time: each try is cut off after 15 minutes.
+          for try in 1 2; do
+            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q ffmpeg xvfb && exit 0
+            echo "::warning::apt-get didn't finish, trying again"; sudo dpkg --configure -a || true
+          done
+          exit 1
       - run: xvfb-run -a python3 tests/smoke.py --desktop
 
   windows:
@@ -173,6 +189,7 @@ jobs:
     name: macOS on an Intel Mac
     needs: macos
     runs-on: macos-15-intel
+    timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4
         with:
