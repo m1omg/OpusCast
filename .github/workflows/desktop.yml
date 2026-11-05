@@ -61,9 +61,17 @@ jobs:
         with:
           name: intro
           path: build-extra
-      - name: ffmpeg (GPL build by BtbN, shared DLLs)
+      - name: ffmpeg (BtbN's GPL build of the newest FFmpeg release, shared DLLs)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip
+          # The newest release branch BtbN builds (n9.0, later n9.1...), not the master snapshot.
+          url=$(gh api repos/BtbN/FFmpeg-Builds/releases/tags/latest --jq '
+            [.assets[].browser_download_url | select(test("/ffmpeg-n[0-9.]+-latest-win64-gpl-shared-[0-9.]+\\.zip$"))]
+            | sort_by(capture("-n(?<v>[0-9.]+)-latest").v | split(".") | map(tonumber)) | last // empty')
+          test -n "$url" || { echo "::error::no FFmpeg release build found at BtbN"; exit 1; }
+          echo "$url"
+          curl -fsSL -o ff.zip "$url"
           unzip -q ff.zip -d ff
           mkdir -p build-extra/ffmpeg
           cp ff/*/bin/* build-extra/ffmpeg/
