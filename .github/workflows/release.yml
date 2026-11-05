@@ -17,6 +17,8 @@ jobs:
 
   desktop:
     uses: ./.github/workflows/desktop.yml
+    with:
+      release: true
 
   publish:
     needs: [android, desktop]

@@ -11,6 +11,11 @@ on:
     paths: ["opuscast*.py", "opuscast", "data/**", "packaging/**", "tests/**", ".github/workflows/desktop.yml"]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      release:
+        description: "Called by the Release workflow: build the apps, skip the Linux-only test"
+        type: boolean
+        default: false
 
 env:
   PYSIDE: "6.8.3"  # Qt 6.8: the last to run on macOS 12
@@ -23,14 +28,27 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - name: pycairo and ffmpeg
+      - name: pycairo
         run: |
           # The runner's package mirror sometimes stalls for a long time: each try is cut off after 15 minutes.
           for try in 1 2; do
-            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q python3-cairo ffmpeg && exit 0
+            sudo timeout 5m apt-get update -q && sudo timeout 10m apt-get install -y -q python3-cairo && exit 0
             echo "::warning::apt-get didn't finish, trying again"; sudo dpkg --configure -a || true
           done
           exit 1
+      - name: ffmpeg (BtbN's static build of the newest FFmpeg release, from GitHub - quicker than Ubuntu's mirror)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api repos/BtbN/FFmpeg-Builds/releases/tags/latest --jq '
+            [.assets[].browser_download_url | select(test("/ffmpeg-n[0-9.]+-latest-linux64-gpl-[0-9.]+\\.tar\\.xz$"))]
+            | sort_by(capture("-n(?<v>[0-9.]+)-latest").v | split(".") | map(tonumber)) | last // empty')
+          test -n "$url" || { echo "::error::no FFmpeg release build found at BtbN"; exit 1; }
+          echo "$url"
+          curl -fsSL -o "$RUNNER_TEMP/ff.tar.xz" "$url"
+          mkdir -p "$RUNNER_TEMP/ff" && tar -xJf "$RUNNER_TEMP/ff.tar.xz" -C "$RUNNER_TEMP/ff" --strip-components=1
+          echo "$RUNNER_TEMP/ff/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ff/bin/ffmpeg" -hide_banner -version | head -1
       - name: Render
         run: |
           mkdir -p build-extra
@@ -44,6 +62,8 @@ jobs:
 
   linux:
     name: Linux command line against a fake TV
+    # Not in a release: Linux isn't packaged, and this already ran on the commit being released.
+    if: ${{ !inputs.release }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
