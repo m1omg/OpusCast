@@ -289,7 +289,9 @@ class _PipeWireFrames:
         probe = Gst.ElementFactory.make("pipewiresrc", None)
         if probe is None:
             raise core.TVError(_("GStreamer's PipeWire plugin is missing"))
-        props = [f"fd={fd}", f"path={node}", "do-timestamp=true"]
+        # the portal names the stream by node id: "path" takes that ("target-object" is its newer stand-in)
+        target = "path" if probe.find_property("path") else "target-object"
+        props = [f"fd={fd}", f"{target}={node}", "do-timestamp=true"]
         if probe.find_property("keepalive-time"):  # repeat the picture while nothing on screen changes
             props.append("keepalive-time=100")
         if probe.find_property("always-copy"):
