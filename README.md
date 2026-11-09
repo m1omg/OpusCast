@@ -16,6 +16,12 @@ No apps on the TV, no servers to set up. OpusCast hands the file to the TV over 
   screen directly, and on Wayland (GNOME, KDE Plasma, …) through the desktop's screen-sharing dialog.
   Choose 720p or 1080p, 30 or 60 frames a second, and which screen. Uses the graphics card's H.264
   encoder when x264 isn't available.
+- **Left the desktop on the TV by mistake?** It stays shared, and the TV remote brings it back: while
+  you share, OpusCast is among the TV's sources as “OpusCast on *your PC*” (Samsung: *Source*; LG,
+  Philips and others: their media player), with the desktop in it. Or click *Show on the TV again* in
+  the window (Enter in the command line). With *Bring it back if the TV leaves* (desktop options,
+  `--bring-back`) it comes back by itself; leave it again right away and it stays off. Only the TV you
+  share to sees your desktop there, and nobody watching for 30 minutes ends sharing.
 - **Picks up where you left off.** Recent videos remember their position and their subtitles.
 - **Subtitles from the PC:** subtitle files next to the video and text subtitles inside it.
   Switch them or turn them off while the movie plays; on Samsung TVs this happens instantly.
@@ -120,11 +126,15 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=<
   && sudo firewall-cmd --reload                                              # firewalld (Fedora)
 ```
 
+While you share the desktop, OpusCast announces itself to the TV's sources every 50 seconds, and the TV
+reaches it on the same port. A TV lists it right away when it may also ask on UDP port 1900 (optional):
+`sudo ufw allow from <TV-IP> to any port 1900 proto udp`.
+
 ## Keys
 
 Space play/pause · ←/→ 10 s · Shift+←/→ 30 s · ↑/↓ TV volume · S subtitles on/off · P show on PC · Ctrl+O open
 · Ctrl+D cast the desktop · Page Up/Down previous/next song or photo · photos: ←/→ previous/next,
-Space slideshow on/off
+Space slideshow on/off · desktop: Space shows it on the TV again after the TV left it
 
 ## Notes
 
