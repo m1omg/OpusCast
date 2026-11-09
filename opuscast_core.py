@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
@@ -1178,6 +1179,16 @@ def _parse_range(header, size):
     return start, end
 
 
+class _HTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse DNS lookup of this computer's name that HTTPServer makes when
+    it starts (socket.getfqdn, never used here): where the network doesn't know the name, it waits for DNS
+    to give up - up to a minute before anything could start."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class MediaServer:
     """Serves one file (plus its subtitle) at a time to the TV, and receives the TV's events.
     Tries DEFAULT_PORT, then the next few."""
@@ -1186,7 +1197,7 @@ class MediaServer:
         last_err = None
         for p in list(range(port, port + 10)) + [0]:
             try:
-                self.httpd = ThreadingHTTPServer(("", p), _Handler)
+                self.httpd = _HTTPServer(("", p), _Handler)
                 break
             except OSError as e:
                 last_err = e

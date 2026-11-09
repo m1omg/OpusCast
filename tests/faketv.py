@@ -13,6 +13,7 @@ import html
 import http.client
 import re
 import socket
+import socketserver
 import threading
 import time
 import urllib.parse
@@ -45,7 +46,12 @@ class FakeTV:
 
         class Handler(_Handler):
             owner = tv
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+        class Server(ThreadingHTTPServer):
+            def server_bind(self):  # (no reverse DNS lookup of this machine's name: slow where it's unknown)
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.location = f"http://127.0.0.1:{self.server.server_address[1]}/dmr"
