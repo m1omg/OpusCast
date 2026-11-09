@@ -377,6 +377,47 @@ SK = {
     "Italian": "Taliančina", "Russian": "Ruština", "Ukrainian": "Ukrajinčina", "Portuguese": "Portugalčina",
     "Dutch": "Holandčina", "Croatian": "Chorvátčina", "Serbian": "Srbčina", "Slovenian": "Slovinčina",
     "Romanian": "Rumunčina", "Japanese": "Japončina", "Chinese": "Čínština", "Korean": "Kórejčina",
+    # sharing the desktop: when the TV leaves it
+    "OpusCast on {pc}": "OpusCast na {pc}",
+    "The TV": "Televízor",
+    "Show on the TV again": "Znova ukázať v televízore",
+    "Stop sharing": "Prestať zdieľať",
+    "Not on the TV": "Nie je v televízore",
+    "Not on the TV now.": "Teraz nie je v televízore.",
+    "Showing it on the TV again…": "Znova sa ukazuje v televízore…",
+    "Still shared, but not on {tv} now": "Stále sa zdieľa, ale na {tv} teraz nie je",
+    "On the TV: choose “{source}” in its sources to go back.":
+        "V televízore sa vrátite výberom „{source}“ medzi jeho zdrojmi.",
+    "{tv} left the desktop - it's still shared.": "Na {tv} už plocha nie je – stále sa však zdieľa.",
+    "{tv} left the desktop - it's still shared. To go back from the TV, choose “{source}” in its sources or media "
+    "player.":
+        "Na {tv} už plocha nie je – stále sa však zdieľa. V televízore sa vrátite výberom „{source}“ medzi jeho "
+        "zdrojmi alebo v prehrávači médií.",
+    "The TV didn't show it again - is it on?": "Televízor ju znova neukázal – je zapnutý?",
+    "Nobody watched the desktop for 30 minutes, so OpusCast stopped sharing it.":
+        "Plochu 30 minút nikto nesledoval, preto sa jej zdieľanie skončilo.",
+    "Bring it back if the TV leaves": "Vrátiť plochu, keď ju televízor opustí",
+    "If the TV leaves the desktop (Back, another source…), OpusCast shows it there again after a few seconds. "
+    "Leave it again right away to keep it off.":
+        "Keď televízor plochu opustí (tlačidlo Späť, iný zdroj…), OpusCast ju tam o pár sekúnd znova ukáže. "
+        "Ak ju hneď znova opustíte, už sa nevráti.",
+    "Left the desktop on the TV? Choose “{source}” in the TV's sources to go back.":
+        "Ak v televízore odídete z plochy, vrátite sa výberom „{source}“ medzi zdrojmi televízora.",
+    "Left it on the TV by mistake? Choose “{source}” in the TV's sources to go back, or press Enter here.":
+        "Ak v televízore omylom odídete z plochy, vráťte sa výberom „{source}“ medzi zdrojmi televízora alebo "
+        "tu stlačte Enter.",
+    "The TV left the desktop - it's still shared. To go back, choose “{source}” in the TV's sources, or press "
+    "Enter here (Ctrl+C stops).":
+        "Televízor opustil plochu – stále sa zdieľa. Vrátite sa výberom „{source}“ medzi zdrojmi televízora "
+        "alebo stlačením Enter tu (Ctrl+C zastaví).",
+    "The TV left the desktop - it's still shared. Press Enter to show it there again (Ctrl+C stops).":
+        "Televízor opustil plochu – stále sa zdieľa. Stlačením Enter ju tam znova ukážete (Ctrl+C zastaví).",
+    "Back on the TV.": "Plocha je znova v televízore.",
+    "The TV left the desktop - showing it there again…": "Televízor opustil plochu – znova sa tam ukazuje…",
+    "The TV didn't show it again - is it on? Press Enter to try again.":
+        "Televízor ju znova neukázal – je zapnutý? Stlačením Enter to skúsite znova.",
+    "desktop: if the TV leaves it, show it there again by itself (leave it twice in a row to stop)":
+        "plocha: keď ju televízor opustí, sama sa tam znova ukáže (ak ju opustíte dvakrát za sebou, už sa nevráti)",
 }
 
 LANGUAGES = {"sk": SK}

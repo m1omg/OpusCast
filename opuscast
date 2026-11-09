@@ -10,7 +10,8 @@
   opuscast SONG... | FOLDER       play songs one after another
   opuscast PHOTO... --every 8     slideshow, a new photo every 8 seconds (one photo stays up)
   opuscast --desktop              show this PC's screen and sound on the TV (--size 720, --fps 60,
-                                  --screen 2, --no-sound)
+                                  --screen 2, --no-sound, --bring-back); if the TV leaves it, it's
+                                  still shared: OpusCast is among the TV's sources, or press Enter
   opuscast --list                 show devices on the network and which can play video
   opuscast --stop                 stop whatever the TV is playing
 """
@@ -87,6 +88,10 @@ def wait_until_done(tv, server, item, quiet=False):
         if state != last and not quiet:
             print(_("TV:"), names.get(state, state.lower()))
         last = state
+        if item["live"] is not None:
+            if core.showing_live(item, state, uri):
+                return True  # the live picture is on the TV: the caller follows it from here
+            continue
         if state == "PLAYING" and ours:
             if not seen and item.get("start_error") is not None and item["start_at"] > 1:
                 try:  # the resume point was never sent
@@ -229,22 +234,107 @@ def cast_desktop(tv, server, cfg, a):
     if cast.restore_token:
         cfg["portal_token"] = cast.restore_token
         core.save_config(cfg)
+    source = None
     try:
         live = server.publish(live=cast.live, title=_("Desktop"))
+        try:
+            source = core.TVSource(server, tv.host, live)
+        except OSError:
+            pass  # no way back from the TV's own menu, the rest works
         start(tv, server, None, media_obj=live)
         print(_("Showing the desktop on {tv}: {how}").format(tv=tv.name, how=cast.describe()))
         if cast.want_sound and not cast.sound:
             print(_("The PC's sound isn't going to the TV: there's no sound server to record it from."))
         print(_("(keep this open - Ctrl+C stops)"))
-        if wait_until_done(tv, server, live, quiet=True) is None:
+        if source:
+            print(_("Left it on the TV by mistake? Choose “{source}” in the TV's sources to go back, or press "
+                    "Enter here.").format(source=source.name))
+        if follow_desktop(tv, server, live, source, a.bring_back) is None:
             sys.exit(1)
     finally:
+        if source:
+            source.close()
         cast.stop()
         if loop:
             loop.quit()
 
 
+def _enter_presses():
+    """An event set each time Enter is pressed here (never, without a keyboard)."""
+    pressed = threading.Event()
+
+    def read():
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except (OSError, ValueError):
+                return
+            if not line:
+                return  # no keyboard (stdin closed or not a terminal)
+            pressed.set()
+    threading.Thread(target=read, daemon=True).start()
+    return pressed
+
+
+def follow_desktop(tv, server, media, source, bring_back=False):
+    """Share until Ctrl+C. When the TV leaves the desktop (Back, another source...), it stays shared: the
+    TV can come back by itself (OpusCast among its sources), Enter here shows it there again, and with
+    bring_back it's sent again by itself once. Nobody watching for 30 minutes ends it. Returns None if
+    the TV never showed it."""
+    if wait_until_done(tv, server, media, quiet=True) is None:
+        return None
+    watch = core.ShareWatch(media, bring_back)
+    watch.started()
+    enter = _enter_presses()
+
+    def send():
+        try:
+            core.play_media(tv, server, media)
+            watch.sent()
+        except core.TVError as e:
+            watch.send_failed()
+            print(_("The TV didn't accept that: {error}").format(error=e))
+            print(_("The TV didn't show it again - is it on? Press Enter to try again."))
+
+    while True:
+        time.sleep(1)
+        if media["live"].closed:
+            return True  # the capture stopped (on_end says why)
+        try:
+            state = tv.state()
+            uri = tv.position()[2]
+        except core.TVError:
+            state = uri = None
+        if enter.is_set():
+            enter.clear()
+            if watch.away and watch.sent_at is None:  # (not while the TV is still taking it)
+                print(_("Showing it on the TV again…"))
+                send()
+        event = watch.update(state, uri)
+        if event == "left":
+            if source:
+                print(_("The TV left the desktop - it's still shared. To go back, choose “{source}” in the TV's "
+                        "sources, or press Enter here (Ctrl+C stops).").format(source=source.name))
+            else:
+                print(_("The TV left the desktop - it's still shared. Press Enter to show it there again "
+                        "(Ctrl+C stops)."))
+        elif event == "back":
+            print(_("Back on the TV."))
+        elif event == "send":
+            print(_("The TV left the desktop - showing it there again…"))
+            send()
+        elif event == "failed":
+            print(_("The TV didn't show it again - is it on? Press Enter to try again."))
+        elif event == "idle":
+            print(_("Nobody watched the desktop for 30 minutes, so OpusCast stopped sharing it."))
+            return True
+
+
 def main():
+    try:  # what it says should show up as it happens, also through a pipe or into a log
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(prog="opuscast", description=_("Play videos, music and photos from this PC on your "
                                                                 "TV, or show it the desktop."))
     ap.add_argument("file", nargs="*", help=_("videos, songs, photos or a folder"))
@@ -259,6 +349,9 @@ def main():
     ap.add_argument("--fps", type=int, choices=(30, 60), default=30, help=_("desktop: pictures a second"))
     ap.add_argument("--screen", type=int, metavar="N", help=_("desktop on X11: which screen (default: the main one)"))
     ap.add_argument("--no-sound", action="store_true", help=_("desktop: without the PC's sound"))
+    ap.add_argument("--bring-back", action="store_true",
+                    help=_("desktop: if the TV leaves it, show it there again by itself (leave it twice in a row "
+                           "to stop)"))
     ap.add_argument("--list", action="store_true", help=_("show devices on the network and which can play video"))
     ap.add_argument("--stop", action="store_true", help=_("stop playback on the TV and exit"))
     a = ap.parse_args()

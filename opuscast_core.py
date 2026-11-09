@@ -5,15 +5,18 @@ CLI works on any Linux with Python 3.8+. The TV pulls the file over HTTP from a 
 server here; we drive it with UPnP AVTransport (play/pause/seek/stop), RenderingControl
 (volume, Samsung subtitles) and listen to its change notifications (GENA events).
 """
+import getpass
 import hashlib
 import html
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
@@ -23,8 +26,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -192,7 +197,8 @@ def didl_time(seconds):
     return f"{ms // 3600000}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
 
 
-def didl(url, title, mime, size=None, kind="video", features=DLNA_FEATURES, sub_url=None, meta=None):
+def didl(url, title, mime, size=None, kind="video", features=DLNA_FEATURES, sub_url=None, meta=None,
+         item_id="0", parent_id="-1"):
     """The DIDL-Lite description the TV gets with the URL: what it is (video, song, photo), its format,
     and for songs the artist, album and cover. Subtitles are announced the Samsung (sec:), LG/Sony/
     others (pv:) and plain DLNA ways."""
@@ -226,7 +232,7 @@ def didl(url, title, mime, size=None, kind="video", features=DLNA_FEATURES, sub_
         'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
         'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" '
         'xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/">'
-        f'<item id="0" parentID="-1" restricted="1"><dc:title>{e(title)}</dc:title>'
+        f'<item id="{e(item_id)}" parentID="{e(parent_id)}" restricted="1"><dc:title>{e(title)}</dc:title>'
         f'<upnp:class>{upnp_class}</upnp:class>{extra}'
         f'<res protocolInfo="http-get:*:{mime}:{features}"{res_attrs}>{e(url)}</res>'
         f'{sub_caption}</item></DIDL-Lite>'
@@ -997,6 +1003,33 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def version_string(self):
+        return SERVER_STRING
+
+    def _source_for(self, path):
+        source = self.server.source
+        return source if source is not None and path.startswith(source.prefix + "/") else None
+
+    def do_POST(self):  # control requests for OpusCast among the TV's sources
+        path = urllib.parse.urlsplit(self.path).path
+        source = self._source_for(path)
+        if source is None:
+            self.close_connection = True
+            self.send_error(404)
+            return
+        source.soap(self, path)
+
+    def do_SUBSCRIBE(self):
+        path = urllib.parse.urlsplit(self.path).path
+        source = self._source_for(path)
+        if source is None:
+            self.close_connection = True
+            self.send_error(404)
+            return
+        source.subscribe(self, path)
+
+    do_UNSUBSCRIBE = do_SUBSCRIBE
+
     def handle(self):
         try:
             super().handle()
@@ -1026,6 +1059,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve(self, send_body):
         media = self.server.media
         path = urllib.parse.urlsplit(self.path).path
+        source = self._source_for(path)
+        if source is not None:
+            source.get(self, path, send_body)
+            return
         if media and (path in media["subs"] or path in media["extras"]):
             mime, data = ("text/srt; charset=utf-8", media["subs"][path]) if path in media["subs"] \
                 else media["extras"][path]
@@ -1142,6 +1179,16 @@ def _parse_range(header, size):
     return start, end
 
 
+class _HTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse DNS lookup of this computer's name that HTTPServer makes when
+    it starts (socket.getfqdn, never used here): where the network doesn't know the name, it waits for DNS
+    to give up - up to a minute before anything could start."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class MediaServer:
     """Serves one file (plus its subtitle) at a time to the TV, and receives the TV's events.
     Tries DEFAULT_PORT, then the next few."""
@@ -1150,7 +1197,7 @@ class MediaServer:
         last_err = None
         for p in list(range(port, port + 10)) + [0]:
             try:
-                self.httpd = ThreadingHTTPServer(("", p), _Handler)
+                self.httpd = _HTTPServer(("", p), _Handler)
                 break
             except OSError as e:
                 last_err = e
@@ -1159,6 +1206,7 @@ class MediaServer:
         self.httpd.daemon_threads = True
         self.httpd.media = None
         self.httpd.on_event = None
+        self.httpd.source = None  # a TVSource while the desktop is shared
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
@@ -1346,6 +1394,13 @@ class LiveStream:
                 pass
         return c
 
+    def watched(self, within=5.0):
+        """Whether a TV is taking the stream: a request that asked for more within the last few seconds.
+        A TV that left closes its request; one that only stopped reading stops asking."""
+        now = time.monotonic()
+        with self.cond:
+            return any(now - c.last_read < within for c in self.clients)
+
     def wait_started(self, timeout):
         """True once the stream has its first keyframe (the TV can be told to play it)."""
         deadline = time.monotonic() + timeout
@@ -1367,10 +1422,12 @@ class LiveStream:
 class _LiveClient:
     def __init__(self, stream):
         self.stream, self.buf, self.waiting = stream, bytearray(), True
+        self.last_read = time.monotonic()
 
     def read(self, timeout=5.0, most=256 << 10):
         """Bytes to send; None if nothing came within timeout; b"" when the stream has ended."""
         cond = self.stream.cond
+        self.last_read = time.monotonic()  # (asked for more: the TV took what came before)
         with cond:
             if not self.buf and not self.stream.closed:
                 cond.wait(timeout)
@@ -1403,6 +1460,421 @@ def _starts_keyframe(pes, stream_type):
             return True
         i = es.find(b"\x00\x00\x01", i + 3)
     return False
+
+
+# ---------------------------------------------------------------- OpusCast among the TV's sources
+
+MEDIA_SERVER = "urn:schemas-upnp-org:device:MediaServer:1"
+CONTENT_DIRECTORY = "urn:schemas-upnp-org:service:ContentDirectory:1"
+CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
+SSDP_GROUP = ("239.255.255.250", 1900)
+SERVER_STRING = (f"{platform.system() or 'OS'}/{(platform.release() or '1').split()[0]} UPnP/1.0 DLNADOC/1.50 "
+                 f"{APP_NAME}/{APP_VERSION}")
+SOAP_ENVELOPE = ('<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/'
+                 'envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>{}</s:Body>'
+                 '</s:Envelope>')
+DIDL_OPEN = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/'
+             'elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-'
+             'org:metadata-1-0/">')
+# Samsung TVs ask which folder to open for their video, music and photo views
+SAMSUNG_FEATURES = ('<Features xmlns="urn:schemas-upnp-org:av:avs" xmlns:xsi="http://www.w3.org/2001/XMLSchema-'
+                    'instance" xsi:schemaLocation="urn:schemas-upnp-org:av:avs http://www.upnp.org/schemas/av/avs.xsd">'
+                    '<Feature name="samsung.com_BASICVIEW" version="1"><container id="0" type="object.item.audioItem"/>'
+                    '<container id="0" type="object.item.videoItem"/><container id="0" type="object.item.imageItem"/>'
+                    '</Feature></Features>')
+
+
+def _scpd(actions, variables):
+    """A UPnP service description: actions {name: [(argument, "in"/"out", state variable)]}, state
+    variables [(name, type, evented, allowed values)]."""
+    acts = "".join(f"<action><name>{name}</name><argumentList>" + "".join(
+        f"<argument><name>{a}</name><direction>{d}</direction><relatedStateVariable>{v}</relatedStateVariable>"
+        "</argument>" for a, d, v in args) + "</argumentList></action>" for name, args in actions.items())
+    svars = "".join(
+        f'<stateVariable sendEvents="{"yes" if evented else "no"}"><name>{name}</name><dataType>{kind}</dataType>'
+        + ("<allowedValueList>" + "".join(f"<allowedValue>{x}</allowedValue>" for x in allowed)
+           + "</allowedValueList>" if allowed else "") + "</stateVariable>"
+        for name, kind, evented, allowed in variables)
+    return ('<?xml version="1.0" encoding="utf-8"?><scpd xmlns="urn:schemas-upnp-org:service-1-0"><specVersion>'
+            f'<major>1</major><minor>0</minor></specVersion><actionList>{acts}</actionList>'
+            f'<serviceStateTable>{svars}</serviceStateTable></scpd>')
+
+
+CDS_SCPD = _scpd({
+    "Browse": [("ObjectID", "in", "A_ARG_TYPE_ObjectID"), ("BrowseFlag", "in", "A_ARG_TYPE_BrowseFlag"),
+               ("Filter", "in", "A_ARG_TYPE_Filter"), ("StartingIndex", "in", "A_ARG_TYPE_Index"),
+               ("RequestedCount", "in", "A_ARG_TYPE_Count"), ("SortCriteria", "in", "A_ARG_TYPE_SortCriteria"),
+               ("Result", "out", "A_ARG_TYPE_Result"), ("NumberReturned", "out", "A_ARG_TYPE_Count"),
+               ("TotalMatches", "out", "A_ARG_TYPE_Count"), ("UpdateID", "out", "A_ARG_TYPE_UpdateID")],
+    "GetSearchCapabilities": [("SearchCaps", "out", "SearchCapabilities")],
+    "GetSortCapabilities": [("SortCaps", "out", "SortCapabilities")],
+    "GetSystemUpdateID": [("Id", "out", "SystemUpdateID")],
+}, [("A_ARG_TYPE_ObjectID", "string", False, ()),
+    ("A_ARG_TYPE_BrowseFlag", "string", False, ("BrowseMetadata", "BrowseDirectChildren")),
+    ("A_ARG_TYPE_Filter", "string", False, ()), ("A_ARG_TYPE_Index", "ui4", False, ()),
+    ("A_ARG_TYPE_Count", "ui4", False, ()), ("A_ARG_TYPE_SortCriteria", "string", False, ()),
+    ("A_ARG_TYPE_Result", "string", False, ()), ("A_ARG_TYPE_UpdateID", "ui4", False, ()),
+    ("SearchCapabilities", "string", False, ()), ("SortCapabilities", "string", False, ()),
+    ("SystemUpdateID", "ui4", True, ())])
+CMS_SCPD = _scpd({
+    "GetProtocolInfo": [("Source", "out", "SourceProtocolInfo"), ("Sink", "out", "SinkProtocolInfo")],
+    "GetCurrentConnectionIDs": [("ConnectionIDs", "out", "CurrentConnectionIDs")],
+    "GetCurrentConnectionInfo": [
+        ("ConnectionID", "in", "A_ARG_TYPE_ConnectionID"), ("RcsID", "out", "A_ARG_TYPE_RcsID"),
+        ("AVTransportID", "out", "A_ARG_TYPE_AVTransportID"), ("ProtocolInfo", "out", "A_ARG_TYPE_ProtocolInfo"),
+        ("PeerConnectionManager", "out", "A_ARG_TYPE_ConnectionManager"),
+        ("PeerConnectionID", "out", "A_ARG_TYPE_ConnectionID"), ("Direction", "out", "A_ARG_TYPE_Direction"),
+        ("Status", "out", "A_ARG_TYPE_ConnectionStatus")],
+}, [("SourceProtocolInfo", "string", True, ()), ("SinkProtocolInfo", "string", True, ()),
+    ("CurrentConnectionIDs", "string", True, ()),
+    ("A_ARG_TYPE_ConnectionStatus", "string", False,
+     ("OK", "ContentFormatMismatch", "InsufficientBandwidth", "UnreliableChannel", "Unknown")),
+    ("A_ARG_TYPE_ConnectionManager", "string", False, ()),
+    ("A_ARG_TYPE_Direction", "string", False, ("Input", "Output")),
+    ("A_ARG_TYPE_ProtocolInfo", "string", False, ()), ("A_ARG_TYPE_ConnectionID", "i4", False, ()),
+    ("A_ARG_TYPE_AVTransportID", "i4", False, ()), ("A_ARG_TYPE_RcsID", "i4", False, ())])
+
+
+class _Fault(Exception):
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code, self.text = code, text
+
+
+def _soap_call(body):
+    """(action, {argument: value}) of a SOAP request; ValueError if it isn't one. Declarations (entity
+    tricks) aren't accepted from the network."""
+    if re.search(rb"<!\s*(DOCTYPE|ENTITY)", body, re.I):
+        raise ValueError("declarations aren't accepted")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        raise ValueError(str(e)) from None
+    soap_body = root.find("{*}Body")
+    if soap_body is None or len(soap_body) == 0:
+        raise ValueError("no SOAP body")
+    call = soap_body[0]
+    return call.tag.rpartition("}")[2], {c.tag.rpartition("}")[2]: (c.text or "") for c in call}
+
+
+def source_name():
+    """What the TV lists OpusCast as among its sources: "OpusCast on <this PC>"."""
+    return _("OpusCast on {pc}").format(pc=socket.gethostname().split(".")[0] or "PC")
+
+
+def source_uuid():
+    """OpusCast's identity among the TV's sources: the same each time on this PC (for this user), so
+    the TV knows it again."""
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user name here
+        user = ""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"opuscast:{socket.gethostname()}:{user}"))
+
+
+class TVSource:
+    """While the desktop is shared, OpusCast is also a small DLNA media server, "OpusCast on <this PC>":
+    TVs list it among their sources (Samsung: Source; LG, Philips and others: their media player) with
+    the shared desktop in it. After leaving the desktop on the TV (Back, another source...), the TV's
+    own remote brings it back - nothing to start again on this computer.
+
+    Only the TV it's shared to sees the desktop there (the folder is empty for anyone else on the
+    network) and gets answers to its searches and its event callbacks. Announced over SSDP every 50 s
+    (TVs forget it 2 minutes after OpusCast goes), described and browsed over the MediaServer's port."""
+
+    LIFETIME = 120
+    ITEM = "desktop"
+
+    def __init__(self, server, tv_host, media):
+        self.server, self.tv_host, self.media = server, tv_host, media
+        self.name = source_name()
+        self.uuid = source_uuid()
+        self.prefix = f"/dms/{self.uuid}"
+        self.ip = local_ip_towards(tv_host)
+        self.location = f"http://{self.ip}:{server.port}{self.prefix}/description.xml"
+        self.update_id = 1
+        self._stop = threading.Event()
+        self._send = self._listen = None
+        try:
+            self._send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            self._send.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            self._send.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.ip))
+        except OSError:
+            self._send = None
+        self._listen = self._listen_socket()
+        server.httpd.source = self
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _listen_socket(self):
+        """The TV's searches go to port 1900, which other UPnP software here may use too: shared. Without
+        it the announcements still get OpusCast listed."""
+        s = None
+        # (Linux shares a port only between sockets that ask alike: try both ways other software does it)
+        for reuse_port in ((True, False) if hasattr(socket, "SO_REUSEPORT") else (False,)):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if reuse_port:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                s.bind(("", SSDP_GROUP[1]))
+                s.settimeout(0.5)
+                break
+            except OSError:
+                if s is not None:
+                    s.close()
+                s = None
+        if s is None:
+            return None
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         socket.inet_aton(SSDP_GROUP[0]) + socket.inet_aton(self.ip))
+        except OSError:
+            pass  # no multicast on this interface: searches sent straight here (UPnP 1.1) still get answers
+        return s
+
+    def close(self):
+        """Gone from the TV's sources (and its folder)."""
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        if self.server.httpd.source is self:
+            self.server.httpd.source = None
+        for _i in range(2):
+            self._notify("ssdp:byebye")
+        for s in (self._send, self._listen):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    # SSDP
+
+    def _targets(self):
+        u = f"uuid:{self.uuid}"
+        return [("upnp:rootdevice", f"{u}::upnp:rootdevice"), (u, u), (MEDIA_SERVER, f"{u}::{MEDIA_SERVER}"),
+                (CONTENT_DIRECTORY, f"{u}::{CONTENT_DIRECTORY}"), (CONNECTION_MANAGER, f"{u}::{CONNECTION_MANAGER}")]
+
+    def _notify(self, nts):
+        if self._send is None:
+            return
+        for nt, usn in self._targets():
+            if nts == "ssdp:alive":
+                msg = (f"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age={self.LIFETIME}\r\n"
+                       f"LOCATION: {self.location}\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nSERVER: {SERVER_STRING}\r\n"
+                       f"USN: {usn}\r\n\r\n")
+            else:
+                msg = f"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nNT: {nt}\r\nNTS: {nts}\r\nUSN: {usn}\r\n\r\n"
+            try:
+                self._send.sendto(msg.encode(), SSDP_GROUP)
+            except OSError:
+                pass
+
+    def _run(self):
+        for _i in range(3):  # UDP gets lost: say it a few times
+            self._notify("ssdp:alive")
+            if self._stop.wait(0.5):
+                return
+        last = time.monotonic()
+        while not self._stop.is_set():
+            if time.monotonic() - last >= 50:
+                self._notify("ssdp:alive")
+                last = time.monotonic()
+            listen = self._listen
+            if listen is None:
+                self._stop.wait(1.0)
+                continue
+            try:
+                data, addr = listen.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                self._listen = None  # closed, or no longer usable: announcing goes on
+                continue
+            try:
+                self._answer(data, addr)
+            except (OSError, ValueError):
+                pass
+
+    def _answer(self, data, addr):
+        """Answer an M-SEARCH for a media server (or for everything) from the TV."""
+        if addr[0] != self.tv_host:
+            return
+        lines = data.decode("utf-8", "ignore").split("\r\n")
+        if not lines[0].upper().startswith("M-SEARCH"):
+            return
+        headers = {}
+        for line in lines[1:]:
+            key, sep, value = line.partition(":")
+            if sep:
+                headers[key.strip().upper()] = value.strip()
+        if headers.get("MAN", "").strip('"').lower() != "ssdp:discover":
+            return
+        st = headers.get("ST", "")
+        for nt, usn in self._targets():
+            if st in ("ssdp:all", nt):
+                msg = (f"HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age={self.LIFETIME}\r\nDATE: {formatdate(usegmt=True)}"
+                       f"\r\nEXT:\r\nLOCATION: {self.location}\r\nSERVER: {SERVER_STRING}\r\nST: {nt}\r\n"
+                       f"USN: {usn}\r\nContent-Length: 0\r\n\r\n")
+                self._listen.sendto(msg.encode(), addr)
+
+    # HTTP: description, service descriptions, control, events
+
+    def _description(self):
+        e, p = html.escape, self.prefix
+        services = "".join(
+            f"<service><serviceType>{stype}</serviceType><serviceId>urn:upnp-org:serviceId:{sid}</serviceId>"
+            f"<SCPDURL>{p}/{short}.xml</SCPDURL><controlURL>{p}/{short}/control</controlURL>"
+            f"<eventSubURL>{p}/{short}/event</eventSubURL></service>"
+            for stype, sid, short in ((CONTENT_DIRECTORY, "ContentDirectory", "cds"),
+                                      (CONNECTION_MANAGER, "ConnectionManager", "cms")))
+        return ('<?xml version="1.0" encoding="utf-8"?><root xmlns="urn:schemas-upnp-org:device-1-0" '
+                'xmlns:dlna="urn:schemas-dlna-org:device-1-0"><specVersion><major>1</major><minor>0</minor>'
+                f'</specVersion><device><deviceType>{MEDIA_SERVER}</deviceType>'
+                f'<dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC><friendlyName>{e(self.name)}</friendlyName>'
+                f'<manufacturer>{APP_NAME}</manufacturer><manufacturerURL>https://github.com/m1omg/OpusCast'
+                f'</manufacturerURL><modelDescription>{APP_NAME} desktop sharing</modelDescription>'
+                f'<modelName>{APP_NAME}</modelName><modelNumber>{APP_VERSION}</modelNumber>'
+                f'<serialNumber>{self.uuid[:8]}</serialNumber><UDN>uuid:{self.uuid}</UDN>'
+                f'<serviceList>{services}</serviceList></device></root>')
+
+    @staticmethod
+    def _reply(handler, status, body, send_body=True):
+        data = body.encode()
+        handler.send_response(status)
+        handler.send_header("Content-Type", 'text/xml; charset="utf-8"')
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("EXT", "")
+        handler.end_headers()
+        if send_body:
+            handler.wfile.write(data)
+
+    def get(self, handler, path, send_body):
+        doc = {"/description.xml": self._description, "/cds.xml": lambda: CDS_SCPD,
+               "/cms.xml": lambda: CMS_SCPD}.get(path[len(self.prefix):])
+        if doc is None:
+            handler.send_error(404)
+            return
+        self._reply(handler, 200, doc(), send_body)
+
+    def soap(self, handler, path):
+        service = {"/cds/control": CONTENT_DIRECTORY, "/cms/control": CONNECTION_MANAGER}.get(path[len(self.prefix):])
+        length = int(handler.headers.get("Content-Length") or 0)
+        if service is None or not 0 < length <= 65536:
+            handler.close_connection = True
+            handler.send_error(404 if service is None else 400)
+            return
+        try:
+            action, args = _soap_call(handler.rfile.read(length))
+        except ValueError:
+            handler.close_connection = True
+            handler.send_error(400)
+            return
+        try:
+            out = self._act(service, action, args, handler.client_address[0])
+            body = (f'<u:{action}Response xmlns:u="{service}">'
+                    + "".join(f"<{k}>{html.escape(str(v), quote=False)}</{k}>" for k, v in out)
+                    + f"</u:{action}Response>")
+            status = 200
+        except _Fault as f:
+            body = ('<s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail>'
+                    f'<UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{f.code}</errorCode>'
+                    f'<errorDescription>{html.escape(f.text)}</errorDescription></UPnPError></detail></s:Fault>')
+            status = 500
+        self._reply(handler, status, SOAP_ENVELOPE.format(body))
+
+    def _protocols(self):
+        mimes = dict.fromkeys([self.media.get("tv_mime") or self.media["mime"], "video/mpeg", "video/mp2t"])
+        return ",".join(f"http-get:*:{m}:*" for m in mimes)
+
+    def _act(self, service, action, args, client):
+        if service == CONNECTION_MANAGER:
+            if action == "GetProtocolInfo":
+                return [("Source", self._protocols()), ("Sink", "")]
+            if action == "GetCurrentConnectionIDs":
+                return [("ConnectionIDs", "0")]
+            if action == "GetCurrentConnectionInfo":
+                return [("RcsID", -1), ("AVTransportID", -1), ("ProtocolInfo", ""), ("PeerConnectionManager", ""),
+                        ("PeerConnectionID", -1), ("Direction", "Output"), ("Status", "OK")]
+            raise _Fault(401, "Invalid Action")
+        if action == "Browse":
+            return self._browse(args, client)
+        if action == "GetSystemUpdateID":
+            return [("Id", self.update_id)]
+        if action == "GetSearchCapabilities":
+            return [("SearchCaps", "")]
+        if action == "GetSortCapabilities":
+            return [("SortCaps", "")]
+        if action == "X_GetFeatureList":  # Samsung
+            return [("FeatureList", '<?xml version="1.0" encoding="UTF-8"?>' + SAMSUNG_FEATURES)]
+        if action == "X_SetBookmark":  # Samsung remembers where it stopped: nothing to remember in a live picture
+            return []
+        raise _Fault(401, "Invalid Action")
+
+    def _browse(self, args, client):
+        oid, flag = args.get("ObjectID", ""), args.get("BrowseFlag", "")
+        try:
+            first, count = max(0, int(args.get("StartingIndex") or 0)), max(0, int(args.get("RequestedCount") or 0))
+        except ValueError:
+            raise _Fault(402, "Invalid Args") from None
+        if flag not in ("BrowseMetadata", "BrowseDirectChildren"):
+            raise _Fault(402, "Invalid Args")
+        shared = client == self.tv_host  # the desktop is only for the TV it's shared to
+        if oid == "0":
+            if flag == "BrowseMetadata":
+                result = (DIDL_OPEN + f'<container id="0" parentID="-1" restricted="1" searchable="0" '
+                          f'childCount="{int(shared)}"><dc:title>{APP_NAME}</dc:title>'
+                          '<upnp:class>object.container.storageFolder</upnp:class></container></DIDL-Lite>')
+                return [("Result", result), ("NumberReturned", 1), ("TotalMatches", 1), ("UpdateID", self.update_id)]
+            shown = shared and first == 0
+            result = self._item() if shown else DIDL_OPEN + "</DIDL-Lite>"
+            return [("Result", result), ("NumberReturned", int(shown)), ("TotalMatches", int(shared)),
+                    ("UpdateID", self.update_id)]
+        if oid == self.ITEM and shared:
+            result = self._item() if flag == "BrowseMetadata" else DIDL_OPEN + "</DIDL-Lite>"
+            n = int(flag == "BrowseMetadata")
+            return [("Result", result), ("NumberReturned", n), ("TotalMatches", n), ("UpdateID", self.update_id)]
+        raise _Fault(701, "No such object")
+
+    def _item(self):
+        m = self.media
+        return didl(self.server.url(m, self.tv_host), m["title"], m.get("tv_mime") or m["mime"], kind="video",
+                    features=m["features"], item_id=self.ITEM, parent_id="0")
+
+    def subscribe(self, handler, path):
+        service = {"/cds/event": CONTENT_DIRECTORY, "/cms/event": CONNECTION_MANAGER}.get(path[len(self.prefix):])
+        if service is None:
+            handler.send_error(404)
+            return
+        sid = handler.headers.get("SID")
+        new = handler.command == "SUBSCRIBE" and not sid
+        if new:
+            sid = f"uuid:{uuid.uuid4()}"
+        handler.send_response(200)
+        if handler.command == "SUBSCRIBE":
+            handler.send_header("SID", sid)
+            handler.send_header("TIMEOUT", "Second-1800")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        m = re.match(r"\s*<([^>]+)>", handler.headers.get("CALLBACK") or "")
+        client = handler.client_address[0]
+        # events only go back to the TV itself (a callback elsewhere would make OpusCast a way to reach others)
+        if new and m and client == self.tv_host and urllib.parse.urlsplit(m.group(1)).hostname == client:
+            threading.Thread(target=self._first_event, args=(service, m.group(1), sid), daemon=True).start()
+
+    def _first_event(self, service, url, sid):
+        props = [("SystemUpdateID", self.update_id)] if service == CONTENT_DIRECTORY else \
+            [("SourceProtocolInfo", self._protocols()), ("SinkProtocolInfo", ""), ("CurrentConnectionIDs", "0")]
+        body = ('<?xml version="1.0" encoding="utf-8"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+                + "".join(f"<e:property><{k}>{html.escape(str(v), quote=False)}</{k}></e:property>" for k, v in props)
+                + "</e:propertyset>").encode()
+        req = urllib.request.Request(url, data=body, method="NOTIFY", headers={
+            "Content-Type": 'text/xml; charset="utf-8"', "NT": "upnp:event", "NTS": "upnp:propchange",
+            "SID": sid, "SEQ": "0"})
+        try:
+            urllib.request.urlopen(req, timeout=3).close()
+        except (OSError, ValueError):
+            pass
 
 
 def show_subtitle(tv, server, media, path=None):
@@ -1531,6 +2003,79 @@ def play_media(tv, server, media, start_at=0, wait=20.0, subs_on=False):
                          args=(tv, server, media, media["caption_seq"], start_at, playing)).start()
         return result
     return None
+
+
+def showing_live(media, state, uri):
+    """Is the TV showing this live stream (the desktop)? Either its media renderer plays it, or the TV took
+    it from OpusCast among its sources - then the renderer knows nothing of it, and only the stream itself
+    shows that it's being watched."""
+    if (not uri or media["url_path"] in uri) and state in ("PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"):
+        return True
+    return media.get("live") is not None and media["live"].watched()
+
+
+class ShareWatch:
+    """Follows the shared desktop on the TV, for the window and the command line alike. When the TV leaves
+    it (Back, another source...), sharing goes on: the TV can come back by itself (OpusCast among its
+    sources), it can be sent again from here, or - if wanted - it's brought back by itself once. Leaving
+    again soon after it came back means it: then it stays off. Nobody watching for 30 minutes ends it.
+
+    update() takes one look at the TV (state and URI None when it didn't answer) and says what happened:
+    None, "shown" (on the TV the first time), "left", "back", "send" (bring it back now), "failed" (sent
+    again, but the TV didn't take it) or "idle" (stop sharing)."""
+
+    LEAVE_AFTER = 3.0  # seconds off the TV before it counts as left (TVs reconnect now and then)
+    GRACE = 15.0  # after sending it again: time for the TV to take it
+    DELIBERATE = 20.0  # left again this soon after coming back: the viewer means it
+    IDLE_LIMIT = 30 * 60
+
+    def __init__(self, media, bring_back=False):
+        self.media, self.bring_back = media, bring_back
+        self.seen = self.away = self.auto_sent = False
+        self.gone_since = self.back_at = self.sent_at = None
+
+    def update(self, state, uri, now=None):
+        now = time.monotonic() if now is None else now
+        if showing_live(self.media, state, uri):
+            self.gone_since = None
+            if not self.seen:
+                self.seen, self.back_at = True, now
+                return "shown"
+            if self.away or self.sent_at is not None:
+                self.away, self.sent_at, self.auto_sent, self.back_at = False, None, False, now
+                return "back"
+            return None
+        if not self.seen:
+            return None  # still starting: the start logic decides
+        if self.gone_since is None:
+            self.gone_since = now
+        if self.sent_at is not None:
+            if now - self.sent_at < self.GRACE:
+                return None
+            self.sent_at, self.away = None, True
+            return "failed"
+        if now - self.gone_since >= self.IDLE_LIMIT:
+            return "idle"
+        if not self.away and now - self.gone_since >= self.LEAVE_AFTER:
+            deliberate = self.back_at is not None and self.gone_since - self.back_at < self.DELIBERATE
+            if self.bring_back and not deliberate and not self.auto_sent:
+                self.auto_sent, self.sent_at = True, now
+                return "send"
+            self.away = True
+            return "left"
+        return None
+
+    def started(self, now=None):
+        """It's on the TV: the start (the TV may have asked "Allow?" first) is over."""
+        self.seen, self.back_at = True, time.monotonic() if now is None else now
+
+    def sent(self, now=None):
+        """It was sent to the TV again (by hand): wait for the TV to take it."""
+        self.sent_at = time.monotonic() if now is None else now
+
+    def send_failed(self):
+        """Sending it again failed at once (the TV didn't answer)."""
+        self.sent_at, self.away = None, True
 
 
 def start_playback(tv, server, path, start_at=0, subtitle=None, subs_on=False):

@@ -568,8 +568,14 @@ class OpusCastWindow(QMainWindow):
             self.slide_btn,
             button(_("Next"), _("Next photo (→)"), lambda: self.step(1), "SP_ArrowForward"),
             self.slide_every))
-        self.transport.addWidget(centered(label("● " + _("LIVE"), "live"),
-                                          label(_("The TV shows the screen a second or two late."), "dim")))
+        self.live_badge = label("● " + _("LIVE"), "live")
+        self.live_again = QPushButton(_("Show on the TV again"))
+        self.live_again.setProperty("role", "suggested")
+        self.live_again.setMinimumHeight(36)
+        self.live_again.clicked.connect(lambda _c=False: self.show_desktop_again())
+        self.live_again.setVisible(False)
+        self.live_note = label(_("The TV shows the screen a second or two late."), "dim", wrap=True)
+        self.transport.addWidget(centered(self.live_badge, self.live_again, self.live_note))
         self.transport_pages = {"video": 0, "music": 1, "photo": 2, "live": 3}
         col.addWidget(self.transport)
 
@@ -679,10 +685,18 @@ class OpusCastWindow(QMainWindow):
         sound.setChecked(bool(self.cfg.get("desk_sound", True)))
         sound.toggled.connect(lambda on: self._desk_set("desk_sound", on))
         rows.append((_("Sound from this PC"), sound))
+        back = QCheckBox()
+        back.setChecked(bool(self.cfg.get("desk_bring_back", False)))
+        back.setToolTip(_("If the TV leaves the desktop (Back, another source…), OpusCast shows it there again "
+                          "after a few seconds. Leave it again right away to keep it off."))
+        back.toggled.connect(self._set_bring_back)
+        rows.append((_("Bring it back if the TV leaves"), back))
         for i, (text, widget) in enumerate(rows):
             grid.addWidget(label(text), i, 0)
             grid.addWidget(widget, i, 1)
-        note = _("The TV shows the screen a second or two late - fine for slides, photos and videos, not for games.")
+        note = (_("The TV shows the screen a second or two late - fine for slides, photos and videos, not for games.")
+                + "\n" + _("Left the desktop on the TV? Choose “{source}” in the TV's sources to go back.").format(
+                    source=core.source_name()))
         if sys.platform == "darwin":
             note += "\n\n" + _("macOS doesn't hand the Mac's sound to apps by itself. With BlackHole (free) "
                                "installed and set as the output, the sound goes to the TV too.")
@@ -1373,6 +1387,9 @@ class OpusCastWindow(QMainWindow):
                 self.session["answering_since"] = 0.0
             if self.poll_errors >= 3:
                 self._set_subtitle(_("Can't reach {tv} - is it on?").format(tv=self.tv.name))
+            s = self.session
+            if s and s.get("watch"):  # a TV that doesn't answer may still be watching the desktop
+                self._follow_desktop(s, None, None)
             return
         if self.poll_errors >= 3:
             self._set_subtitle(_("Connected to {tv}").format(tv=self.tv.name))
@@ -1409,6 +1426,12 @@ class OpusCastWindow(QMainWindow):
                 self.hold = None
         if photo:
             finished = s["seen_playing"] and bool(uri) and not ours  # something else is on the TV now
+        elif s.get("watch"):  # the shared desktop: the TV leaving it doesn't end it
+            finished = False
+            if not s["seen_playing"] and core.showing_live(s["media"], state, uri):
+                s["seen_playing"] = True  # (taken from OpusCast among the TV's sources)
+            if self._follow_desktop(s, state, uri):
+                return
         else:
             finished = s["seen_playing"] and (state in ("STOPPED", "NO_MEDIA_PRESENT") or not ours)
         if finished:
@@ -1452,6 +1475,11 @@ class OpusCastWindow(QMainWindow):
             text = _("Loading subtitles…")
         if s["kind"] == "photo" and s["start_error"] is None:
             text = _("On the TV") if s["seen_playing"] else _("Sending the photo…")
+        w = s.get("watch")
+        if w and w.sent_at is not None:
+            text = _("Showing it on the TV again…")
+        elif w and w.away:
+            text = _("Not on the TV")
         line = f"{text} - {self.tv.name}" if self.tv else text
         if s["kind"] == "music":
             line = " · ".join(x for x in (media.song_line(s["tags"]), line) if x)
@@ -1507,6 +1535,9 @@ class OpusCastWindow(QMainWindow):
             self.worker.submit(self.tv.stop)
         if s["cast"]:
             threading.Thread(target=s["cast"].stop, daemon=True).start()
+        if s.get("source"):
+            threading.Thread(target=s["source"].close, daemon=True).start()
+        self._drop_bar(s.get("away_bar"))  # "it's still shared" isn't true any more
         self._cancel_slide()
         self.preview.unload()
         self.hold = None
@@ -1525,6 +1556,8 @@ class OpusCastWindow(QMainWindow):
             self.toggle_slideshow()
             return
         if self.session["kind"] == "desktop":
+            if self.session.get("watch") and self.session["watch"].away:
+                self.show_desktop_again()
             return  # a live picture: pausing would only make it fall behind
         if self.tv_state == "PLAYING":
             self.tv_pos, self.tv_state = self.est_pos(), "PAUSED_PLAYBACK"
@@ -1561,7 +1594,8 @@ class OpusCastWindow(QMainWindow):
                 threading.Thread(target=cast.stop, daemon=True).start()
             self.stack.setCurrentIndex(0)
             return
-        self._end_session(stop_tv=True)
+        w = self.session.get("watch")
+        self._end_session(stop_tv=not (w and w.away))  # a TV that left the desktop shows something else now
 
     # ------------------------------------------------------------ music, photos, the desktop
 
@@ -1809,6 +1843,12 @@ class OpusCastWindow(QMainWindow):
         self.cfg[key] = value
         self._save()
 
+    def _set_bring_back(self, on):
+        self._desk_set("desk_bring_back", on)
+        s = self.session
+        if s and s.get("watch"):
+            s["watch"].bring_back = on
+
     def _fill_desk_screens(self):
         c = self.desk_screen
         c.clear()
@@ -1894,7 +1934,15 @@ class OpusCastWindow(QMainWindow):
             self.cfg["portal_token"] = cast.restore_token  # next time the desktop shares without asking
             self._save()
         m = self.server.publish(live=cast.live, title=_("Desktop"))
-        self._start_session("desktop", None, 0, media=m, title=_("Your desktop"), cast=cast)
+        source = None
+        try:
+            source = core.TVSource(self.server, self.tv.host, m)
+        except OSError:
+            pass  # no way back from the TV's own menu; the rest works
+        watch = core.ShareWatch(m, bool(self.cfg.get("desk_bring_back", False)))
+        self._start_session("desktop", None, 0, media=m, title=_("Your desktop"), cast=cast, source=source,
+                            watch=watch)
+        self._update_live_row(self.session)
         if self.cfg.get("desk_sound", True) and not cast.sound:
             if sys.platform == "darwin":
                 self.show_info(_("The Mac's sound isn't going to the TV: macOS doesn't hand it to apps by "
@@ -1903,6 +1951,95 @@ class OpusCastWindow(QMainWindow):
             else:
                 self.show_info(_("The PC's sound isn't going to the TV: there's no sound server to record it from."),
                                WARNING)
+
+    def _follow_desktop(self, s, state, uri):
+        """The shared desktop on the TV (core.ShareWatch decides): when the TV leaves it, it stays shared -
+        the TV can come back by itself (OpusCast among its sources) or it's shown there again from here.
+        Returns True when sharing ended (nobody watched for 30 minutes)."""
+        event = s["watch"].update(state, uri)
+        if event in ("left", "failed"):
+            self._desktop_left(s, event)
+        elif event == "back":
+            self._drop_bar(s.get("away_bar"))
+            s["away_bar"] = None
+            self.tv_state = "PLAYING"
+        elif event == "send":
+            self._send_desktop(s)
+        elif event == "idle":
+            self._end_session(stop_tv=False)
+            self.show_info(_("Nobody watched the desktop for 30 minutes, so OpusCast stopped sharing it."), INFO)
+            return True
+        if event:
+            self._update_live_row(s)
+            self._update_status()
+        return False
+
+    def _desktop_left(self, s, event, error=None):
+        tv = self.tv.name if self.tv else _("The TV")
+        if error is not None:
+            text = _("The TV didn't accept that: {error}").format(error=error)
+        elif event == "failed":
+            text = _("The TV didn't show it again - is it on?")
+        elif s.get("source"):
+            text = _("{tv} left the desktop - it's still shared. To go back from the TV, choose “{source}” in its "
+                     "sources or media player.").format(tv=tv, source=s["source"].name)
+        else:
+            text = _("{tv} left the desktop - it's still shared.").format(tv=tv)
+        self._drop_bar(s.get("away_bar"))
+        s["away_bar"] = self.show_info(text, WARNING if error is not None or event == "failed" else INFO,
+                                       [(_("Show on the TV again"), self.show_desktop_again),
+                                        (_("Stop sharing"), self.stop)])
+
+    def show_desktop_again(self):
+        """Send the shared desktop to the TV again (after the TV left it)."""
+        s = self.session
+        if not (s and s.get("watch") and self.tv) or s["watch"].sent_at is not None:
+            return
+        s["watch"].sent()
+        self._drop_bar(s.get("away_bar"))
+        s["away_bar"] = None
+        self._send_desktop(s)
+        self._update_live_row(s)
+        self._update_status()
+
+    def _send_desktop(self, s):
+        tv, gen = self.tv, s["gen"]
+
+        def work():
+            try:
+                core.play_media(tv, self.server, s["media"])
+                return None
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                return e
+
+        def done(error):
+            self.poller.wake.set()
+            if error is None or self.session is not s or s["gen"] != gen:
+                return
+            s["watch"].send_failed()
+            self._desktop_left(s, "failed", error)
+            self._update_live_row(s)
+            self._update_status()
+        self.worker.submit(work, done=done)
+
+    def _update_live_row(self, s):
+        w = s.get("watch") if s else None
+        away, sending = bool(w and w.away), bool(w and w.sent_at is not None)
+        self.live_badge.setVisible(not away)
+        self.live_again.setVisible(away)
+        self.live_again.setEnabled(not sending)
+        if away and sending:
+            text = _("Showing it on the TV again…")
+        elif away and s.get("source"):
+            text = _("On the TV: choose “{source}” in its sources to go back.").format(source=s["source"].name)
+        elif away:
+            text = _("Not on the TV now.")
+        else:
+            text = _("The TV shows the screen a second or two late.")
+        self.live_note.setText(text)
+        if s and self.tv:
+            self.placeholder_label.setText(_("Still shared, but not on {tv} now").format(tv=self.tv.name)
+                                           if away else _("Playing on {tv}").format(tv=self.tv.name))
 
     def _cast_ended(self, cast, message):
         s = self.session
@@ -2250,6 +2387,8 @@ class OpusCastWindow(QMainWindow):
             self.step(1 if k == Qt.Key_PageDown else -1)
         elif kind == "photo" and k in (Qt.Key_Left, Qt.Key_Right):
             self.step(1 if k == Qt.Key_Right else -1)
+        elif kind == "desktop" and k == Qt.Key_Space and self.session.get("watch") and self.session["watch"].away:
+            self.show_desktop_again()
         elif kind == "desktop" and k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Space):
             return False
         elif kind != "movie" and k in (Qt.Key_P, Qt.Key_S):
