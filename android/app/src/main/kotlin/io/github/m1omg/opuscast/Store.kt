@@ -17,6 +17,10 @@ class Settings(
     var slideSeconds: Int = 5,
     /** Cast the screen in 1080p (else 720p, lighter on the Wi-Fi). */
     var screenHd: Boolean = true,
+    /** Show the screen on the TV again by itself when the TV leaves it. */
+    var screenBringBack: Boolean = false,
+    /** OpusCast's identity among the TV's sources: the same each time, so the TV knows it again. */
+    var sourceId: String? = null,
 )
 
 /** Settings as JSON in the app's private files (like ~/.config/opuscast/config.json on Linux). */
@@ -35,7 +39,8 @@ class Store(dir: File) {
         }
         Settings(tv?.optString("location")?.ifEmpty { null }, tv?.optString("name")?.ifEmpty { null },
             o.optBoolean("preview", false), o.optBoolean("intro", false), RecentList(recent),
-            o.optInt("slide_seconds", 5), o.optBoolean("screen_hd", true))
+            o.optInt("slide_seconds", 5), o.optBoolean("screen_hd", true), o.optBoolean("screen_bring_back", false),
+            o.optString("source_id").ifEmpty { null })
     } catch (e: Exception) {
         Settings()
     }
@@ -47,6 +52,8 @@ class Store(dir: File) {
         o.put("intro", s.intro)
         o.put("slide_seconds", s.slideSeconds)
         o.put("screen_hd", s.screenHd)
+        o.put("screen_bring_back", s.screenBringBack)
+        if (s.sourceId != null) o.put("source_id", s.sourceId)
         o.put("recent", JSONArray().apply {
             for (r in s.recent.items) put(JSONObject().put("ref", r.ref).put("name", r.name).put("pos", r.pos)
                 .put("dur", r.dur).put("watched", r.watched).put("sub", r.sub ?: JSONObject.NULL))

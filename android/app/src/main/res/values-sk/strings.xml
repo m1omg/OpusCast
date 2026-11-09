@@ -153,4 +153,18 @@
     <string name="err_sub_unreadable">súbor s titulkami sa nedá prečítať (%1$s)</string>
     <string name="err_sub_bad">tieto titulky sa nedali načítať (%1$s)</string>
     <string name="err_file">video sa nedá prečítať (%1$s)</string>
+    <!-- televízor opustil obrazovku telefónu: stále sa zdieľa -->
+    <string name="source_name">OpusCast na %1$s</string>
+    <string name="show_again">Znova ukázať v televízore</string>
+    <string name="stop_sharing">Prestať zdieľať</string>
+    <string name="not_on_tv">Nie je v televízore</string>
+    <string name="showing_again">Znova sa ukazuje v televízore…</string>
+    <string name="still_shared">Stále sa zdieľa, ale na %1$s teraz nie je</string>
+    <string name="screen_left">Na %1$s už obrazovka telefónu nie je – stále sa však zdieľa.</string>
+    <string name="screen_left_source">Na %1$s už obrazovka telefónu nie je – stále sa však zdieľa. V televízore sa vrátite výberom „%2$s“ medzi jeho zdrojmi alebo v prehrávači médií.</string>
+    <string name="screen_not_back">Televízor ju znova neukázal – je zapnutý?</string>
+    <string name="screen_idle">Obrazovku telefónu 30 minút nikto nesledoval, preto sa jej zdieľanie skončilo.</string>
+    <string name="screen_back_hint">V televízore sa vrátite výberom „%1$s“ medzi jeho zdrojmi.</string>
+    <string name="screen_source_hint">Ak v televízore omylom odídete z obrazovky, vráťte sa výberom „%1$s“ medzi zdrojmi televízora.</string>
+    <string name="bring_back">Vrátiť obrazovku, keď ju televízor opustí</string>
 </resources>

@@ -42,6 +42,12 @@ object Lan {
         return LanInfo(null, 24, null)
     }
 
+    /** A Wi-Fi multicast lock, held until released (to hear the TV's searches while the phone is among its sources). */
+    fun multicastLock(context: Context, tag: String): WifiManager.MulticastLock? {
+        val wifi = context.applicationContext.getSystemService(WifiManager::class.java) ?: return null
+        return runCatching { wifi.createMulticastLock(tag).apply { setReferenceCounted(false); acquire() } }.getOrNull()
+    }
+
     /** Run [block] with a Wi-Fi multicast lock held (some phones drop SSDP traffic without one). */
     fun <T> withMulticast(context: Context, block: () -> T): T {
         val wifi = context.applicationContext.getSystemService(WifiManager::class.java)

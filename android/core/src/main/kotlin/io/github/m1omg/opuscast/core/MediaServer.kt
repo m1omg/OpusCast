@@ -162,6 +162,8 @@ class MediaServer(port: Int = DEFAULT_PORT) {
         private set
     /** Called with (service, SID, body) for each NOTIFY from the TV, on a server thread. */
     @Volatile var onEvent: ((String, String?, String) -> Unit)? = null
+    /** The phone among the TV's sources while its screen is shared (see [TvSource]); its requests go there. */
+    @Volatile var source: TvSource? = null
     private val random = SecureRandom()
     private val pool = Executors.newCachedThreadPool(object : ThreadFactory {
         private val n = AtomicInteger()
@@ -316,6 +318,16 @@ class MediaServer(port: Int = DEFAULT_PORT) {
             }
             return true
         }
+        val src = source
+        if (src != null && path.startsWith(src.prefix + "/")) {
+            val size = headers["content-length"]?.toIntOrNull() ?: 0
+            if (size < 0 || size > 65536) return false
+            val reply = src.handle(method, path, headers, if (size > 0) readExactly(input, size) else ByteArray(0),
+                c.inetAddress?.hostAddress ?: "")
+            respond(out, reply.code, reply.reason, reply.headers + ("Content-Length" to reply.body.size.toString()))
+            if (method != "HEAD") out.write(reply.body)
+            return true
+        }
         // a body we don't want would get in the way of the next request on this connection
         val length = headers["content-length"]?.toLongOrNull() ?: 0
         if (length > 0) {
@@ -421,7 +433,7 @@ class MediaServer(port: Int = DEFAULT_PORT) {
     }
 
     private fun respond(out: OutputStream, code: Int, reason: String, headers: List<Pair<String, String>>) {
-        val sb = StringBuilder("HTTP/1.1 $code $reason\r\nServer: OpusCast\r\nDate: ${httpDate()}\r\n")
+        val sb = StringBuilder("HTTP/1.1 $code $reason\r\nServer: $SERVER_STRING\r\nDate: ${httpDate()}\r\n")
         for ((k, v) in headers) sb.append(k).append(": ").append(v).append("\r\n")
         sb.append("\r\n")
         out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
