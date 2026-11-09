@@ -279,7 +279,7 @@ class ItemInfo(
 
 /** The DIDL-Lite metadata sent with the item. Subtitles are announced the Samsung (sec:), LG/Sony/others
  *  (pv:) and plain DLNA ways; music gets artist, album and cover the way DLNA servers send them. */
-internal fun didl(url: String, item: ItemInfo): String {
+internal fun didl(url: String, item: ItemInfo, itemId: String = "0", parentId: String = "-1"): String {
     val e = ::xmlEscape
     val res = StringBuilder()
     item.size?.takeIf { it >= 0 }?.let { res.append(" size=\"$it\"") }
@@ -308,7 +308,7 @@ internal fun didl(url: String, item: ItemInfo): String {
     return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
         "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
         "xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" xmlns:sec=\"http://www.sec.co.kr/\" xmlns:pv=\"http://www.pv.com/pvns/\">" +
-        "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>${e(item.title)}</dc:title>" +
+        "<item id=\"${e(itemId)}\" parentID=\"${e(parentId)}\" restricted=\"1\"><dc:title>${e(item.title)}</dc:title>" +
         "<upnp:class>$cls</upnp:class>$meta" +
         "<res protocolInfo=\"http-get:*:${item.mime}:${item.features}\"$res>${e(url)}</res>" +
         "$subCaption</item></DIDL-Lite>"

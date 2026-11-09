@@ -154,4 +154,18 @@
     <string name="err_sub_unreadable">can\'t read the subtitle file (%1$s)</string>
     <string name="err_sub_bad">couldn\'t read these subtitles (%1$s)</string>
     <string name="err_file">can\'t read the video (%1$s)</string>
+    <!-- the TV left the phone's screen: it's still shared -->
+    <string name="source_name">OpusCast on %1$s</string>
+    <string name="show_again">Show on the TV again</string>
+    <string name="stop_sharing">Stop sharing</string>
+    <string name="not_on_tv">Not on the TV</string>
+    <string name="showing_again">Showing it on the TV again…</string>
+    <string name="still_shared">Still shared, but not on %1$s now</string>
+    <string name="screen_left">%1$s left the phone\'s screen - it\'s still shared.</string>
+    <string name="screen_left_source">%1$s left the phone\'s screen - it\'s still shared. To go back from the TV, choose “%2$s” in its sources or media player.</string>
+    <string name="screen_not_back">The TV didn\'t show it again - is it on?</string>
+    <string name="screen_idle">Nobody watched the phone\'s screen for 30 minutes, so OpusCast stopped sharing it.</string>
+    <string name="screen_back_hint">On the TV: choose “%1$s” in its sources to go back.</string>
+    <string name="screen_source_hint">Left it on the TV by mistake? Choose “%1$s” in the TV\'s sources to go back.</string>
+    <string name="bring_back">Bring it back if the TV leaves</string>
 </resources>

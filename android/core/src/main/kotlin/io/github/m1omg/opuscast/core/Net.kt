@@ -100,8 +100,9 @@ internal fun httpRequest(
     }
 }
 
-/** A request with a method HttpURLConnection refuses to send (SUBSCRIBE, UNSUBSCRIBE), over a plain socket. */
-internal fun rawHttpRequest(url: String, method: String, headers: Map<String, String>, timeoutMs: Int = 5000): HttpResult {
+/** A request with a method HttpURLConnection refuses to send (SUBSCRIBE, UNSUBSCRIBE, NOTIFY), over a plain socket. */
+internal fun rawHttpRequest(url: String, method: String, headers: Map<String, String>, timeoutMs: Int = 5000,
+                            body: ByteArray? = null): HttpResult {
     val u = URI(url)
     val port = if (u.port > 0) u.port else 80
     val path = (u.rawPath ?: "").ifEmpty { "/" } + (u.rawQuery?.let { "?$it" } ?: "")
@@ -110,8 +111,12 @@ internal fun rawHttpRequest(url: String, method: String, headers: Map<String, St
         s.soTimeout = timeoutMs
         val req = StringBuilder("$method $path HTTP/1.1\r\nHOST: ${u.host}:$port\r\n")
         for ((k, v) in headers) req.append("$k: $v\r\n")
-        req.append("Content-Length: 0\r\nConnection: close\r\n\r\n")
-        s.getOutputStream().apply { write(req.toString().toByteArray(Charsets.ISO_8859_1)); flush() }
+        req.append("Content-Length: ${body?.size ?: 0}\r\nConnection: close\r\n\r\n")
+        s.getOutputStream().apply {
+            write(req.toString().toByteArray(Charsets.ISO_8859_1))
+            if (body != null) write(body)
+            flush()
+        }
         val input = s.getInputStream()
         val head = readHead(input) ?: throw IOException("no answer")
         val lines = head.split("\r\n")

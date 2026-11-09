@@ -345,7 +345,8 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
                 verticalArrangement = Arrangement.Center) {
                 Icon(icon, contentDescription = null, modifier = Modifier.size(88.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
-                if (p.tvName != null) Text(stringResource(R.string.playing_on, p.tvName), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (p.tvName != null) Text(stringResource(if (p.away) R.string.still_shared else R.string.playing_on, p.tvName),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -409,8 +410,23 @@ private fun PlayerPage(p: PlayerUi, ui: UiState, engine: Engine, openSubtitles: 
                     }
                 }
             }
-            PlayerMode.SCREEN -> Text(stringResource(if (p.sound) R.string.screen_note_sound else R.string.screen_note),
-                style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 8.dp))
+            PlayerMode.SCREEN -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(horizontal = 8.dp)) {
+                if (p.away) { // the TV left it: it's still shared
+                    Button(onClick = engine::showScreenAgain, enabled = !p.sendingAgain) {
+                        Icon(Icons.Filled.Cast, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(stringResource(R.string.show_again))
+                    }
+                    if (p.sourceName != null) Text(stringResource(R.string.screen_back_hint, p.sourceName),
+                        style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 8.dp))
+                } else {
+                    Text(stringResource(if (p.sound) R.string.screen_note_sound else R.string.screen_note),
+                        style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+                    if (p.sourceName != null) Text(stringResource(R.string.screen_source_hint, p.sourceName),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp))
+                }
+            }
         }
         Spacer(Modifier.height(12.dp))
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
@@ -478,6 +494,7 @@ private fun OptionsBar(ui: UiState, engine: Engine) {
                 Toggle(stringResource(R.string.show_on_phone), ui.previewOn) { engine.setPreview(it) }
                 Toggle(stringResource(R.string.skynet_intro), ui.introOn) { engine.setIntro(it) }
                 Toggle(stringResource(R.string.screen_hd), ui.screenHd) { engine.setScreenHd(it) }
+                Toggle(stringResource(R.string.bring_back), ui.screenBringBack) { engine.setScreenBringBack(it) }
             }
             ui.introProgress?.let { p ->
                 Text(stringResource(R.string.preparing_intro_pct, (p * 100).toInt()), style = MaterialTheme.typography.bodySmall,

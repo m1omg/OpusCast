@@ -37,6 +37,8 @@ class LiveHub(private val maxBacklog: Int = 8 shl 20, private val maxGop: Int = 
         /** Waiting for a keyframe to start (again) from. */
         internal var waiting = true
         internal var gone = false
+        /** System.nanoTime() when the TV last asked for more (it took what came before). */
+        @Volatile internal var lastRead = System.nanoTime()
 
         internal fun add(p: ByteArray) {
             queue.addLast(p)
@@ -45,6 +47,7 @@ class LiveHub(private val maxBacklog: Int = 8 shl 20, private val maxGop: Int = 
 
         /** The next bytes for the TV; empty after [timeoutMs] without any; null once the stream is over. */
         fun read(timeoutMs: Long): ByteArray? = lock.withLock {
+            lastRead = System.nanoTime()
             var left = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             while (queue.isEmpty() && !closed && !gone && left > 0) left = changed.awaitNanos(left)
             if (queue.isEmpty()) return@withLock if (closed || gone) null else ByteArray(0)
@@ -68,6 +71,13 @@ class LiveHub(private val maxBacklog: Int = 8 shl 20, private val maxGop: Int = 
                 queued = 0
             }
         }
+    }
+
+    /** Whether a TV is taking the stream: a reader that asked for more within the last [withinMs]. A TV that
+     *  left closes its request; one that only stopped reading stops asking. */
+    fun watched(withinMs: Long = 5000): Boolean {
+        val now = System.nanoTime()
+        return lock.withLock { clients.any { now - it.lastRead < withinMs * 1_000_000 } }
     }
 
     /** A new reader, starting at the latest keyframe (or the next one, if none has come yet). */

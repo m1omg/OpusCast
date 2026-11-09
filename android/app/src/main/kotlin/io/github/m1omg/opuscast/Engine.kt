@@ -37,6 +37,10 @@ import io.github.m1omg.opuscast.core.probeHosts
 import io.github.m1omg.opuscast.core.scanNetwork
 import io.github.m1omg.opuscast.core.showSubtitle
 import io.github.m1omg.opuscast.core.FileSource
+import io.github.m1omg.opuscast.core.ShareWatch
+import io.github.m1omg.opuscast.core.TvSource
+import io.github.m1omg.opuscast.core.showingLive
+import android.net.wifi.WifiManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.File
@@ -94,6 +98,12 @@ data class PlayerUi(
     val slideSeconds: Int = 5,
     /** Screen casting: with the sound apps play (not silence). */
     val sound: Boolean = false,
+    /** Screen casting: the TV left the screen (it's still shared). */
+    val away: Boolean = false,
+    /** ... and it's being sent to the TV again. */
+    val sendingAgain: Boolean = false,
+    /** What the TV lists the phone as among its sources while the screen is shared. */
+    val sourceName: String? = null,
 )
 
 data class UiState(
@@ -117,6 +127,8 @@ data class UiState(
     val musicOnly: Boolean = false,
     /** Screen casting in 1080p (else 720p). */
     val screenHd: Boolean = true,
+    /** Screen casting: show it on the TV again by itself when the TV leaves it. */
+    val screenBringBack: Boolean = false,
 )
 
 /** Position on the TV, ticking 4 times a second (estimated between the TV's answers). */
@@ -165,6 +177,12 @@ private class Session(
     /** subtitle id -> URL path on the server */
     val paths = HashMap<String, String>()
     var subCancel: Cancel? = null
+    /** Screen casting: follows the screen on the TV (the TV leaving it doesn't end it). */
+    var watch: ShareWatch? = null
+    /** Screen casting: the phone among the TV's sources. */
+    var source: TvSource? = null
+    /** The banner saying the TV left the screen (0 = none). */
+    var awayBanner = 0
 }
 
 private class PollResult(val tv: Tv) {
@@ -216,6 +234,8 @@ class Engine(private val app: Context) {
     private val photoCache = LinkedHashMap<String, PreparedPhoto>()
     private val photoWork = HashSet<String>()
     private var screen: ScreenCast? = null
+    /** Held while the phone is among the TV's sources: the TV's searches for it come by multicast. */
+    private var sourceLock: WifiManager.MulticastLock? = null
     /** What the player page shows until the session (re)starts: the last photo stays while the next one is made. */
     private var playerArt: Bitmap? = null
     private var playerMode = PlayerMode.VIDEO
@@ -246,6 +266,7 @@ class Engine(private val app: Context) {
     val clock: StateFlow<Clock> = _clock
 
     init {
+        appVersion()?.let { io.github.m1omg.opuscast.core.productVersion = it }
         server.addressFor = { host -> lan.addressFor(host) }
         server.onEvent = { service, sid, body -> main.post { onEvent(service, sid, body) } }
         statusLine = str(R.string.looking_for_tv)
@@ -256,6 +277,13 @@ class Engine(private val app: Context) {
     }
 
     private fun str(id: Int, vararg args: Any): String = app.getString(id, *args)
+
+    @Suppress("DEPRECATION") // getPackageInfo(String, Int) before Android 13
+    private fun appVersion(): String? = runCatching {
+        val pm = app.packageManager
+        if (Build.VERSION.SDK_INT >= 33) pm.getPackageInfo(app.packageName, PackageManager.PackageInfoFlags.of(0)).versionName
+        else pm.getPackageInfo(app.packageName, 0).versionName
+    }.getOrNull()
 
     // ------------------------------------------------------------ state for the UI
 
@@ -289,12 +317,16 @@ class Engine(private val app: Context) {
             slideshow = slideshow,
             slideSeconds = settings.slideSeconds,
             sound = screen?.capturingSound == true,
+            away = s?.watch?.away == true,
+            sendingAgain = s?.watch?.sentAt != null,
+            sourceName = s?.source?.name,
         ) else null
         _ui.value = UiState(
             tvName = tv?.name, tvHost = tv?.host, searchingTv = searchingTv, statusLine = statusLine, devices = devices, scanning = scanning,
             recent = settings.recent.items, banner = banner, page = page, player = player, volume = volume,
             previewOn = settings.preview, introOn = settings.intro, introProgress = introProgress,
             sessionActive = s != null || (pl != null && page == Page.PLAYER), musicOnly = musicOnly, screenHd = settings.screenHd,
+            screenBringBack = settings.screenBringBack,
         )
     }
 
@@ -1081,12 +1113,116 @@ class Engine(private val app: Context) {
         val media = server.publishLive(hub, str(R.string.screen_title), mime = tvSink.spell("video/mpeg"))
         playerMode = PlayerMode.SCREEN
         playerArt = null
-        startSession(Kind.SCREEN, Video("screen", str(R.string.screen_title), -1), 0.0, media = media)
+        startSession(Kind.SCREEN, Video("screen", str(R.string.screen_title), -1), 0.0, media = media) { s ->
+            s.watch = ShareWatch(media, settings.screenBringBack)
+        }
+        openSource(media)
         if (!sound && Build.VERSION.SDK_INT >= 29) showInfo(str(R.string.screen_no_sound))
         else if (Build.VERSION.SDK_INT < 29) showInfo(str(R.string.screen_no_sound_old))
     }
 
     val screenActive: Boolean get() = screen != null
+
+    fun setScreenBringBack(on: Boolean) {
+        settings.screenBringBack = on
+        session?.watch?.bringBack = on
+        save()
+        publish()
+    }
+
+    /** The phone among the TV's sources while its screen is shared ("OpusCast on <this phone>"), so the TV's
+     *  remote can go back to it. Made off the main thread: it looks up the phone's address towards the TV. */
+    private fun openSource(media: Media) {
+        val t = tv ?: return
+        val g = gen
+        val name = str(R.string.source_name, deviceName())
+        val id = settings.sourceId ?: java.util.UUID.randomUUID().toString().also { settings.sourceId = it; save() }
+        thread(isDaemon = true, name = "opuscast-source-start") {
+            val src = runCatching { TvSource(server, t.host, media, name, id) }.getOrNull() ?: return@thread
+            main.post {
+                val s = session
+                if (s == null || s.gen != g || s.watch == null) {
+                    thread(isDaemon = true) { src.close() }
+                    return@post
+                }
+                s.source = src
+                sourceLock = Lan.multicastLock(app, "opuscast-source")
+                publish()
+            }
+        }
+    }
+
+    private fun deviceName(): String = runCatching {
+        android.provider.Settings.Global.getString(app.contentResolver, android.provider.Settings.Global.DEVICE_NAME)
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: Build.MODEL ?: "Android"
+
+    /** The shared screen on the TV (core.ShareWatch decides): when the TV leaves it, it stays shared - the TV
+     *  can come back by itself (OpusCast among its sources) or it's sent there again from the phone.
+     *  Returns true when sharing ended (nobody watched for 30 minutes). */
+    private fun followScreen(s: Session, state: String?, uri: String?): Boolean {
+        val w = s.watch ?: return false
+        when (w.update(state, uri) ?: return false) {
+            ShareWatch.Event.LEFT -> screenLeft(s, failed = false)
+            ShareWatch.Event.FAILED -> screenLeft(s, failed = true)
+            ShareWatch.Event.BACK -> {
+                if (s.awayBanner != 0 && banner?.id == s.awayBanner) banner = null
+                tvState = "PLAYING"
+            }
+            ShareWatch.Event.SEND -> sendScreen(s)
+            ShareWatch.Event.IDLE -> {
+                endSession(stopTv = false)
+                showInfo(str(R.string.screen_idle))
+                return true
+            }
+            ShareWatch.Event.SHOWN -> {}
+        }
+        updateStatus()
+        return false
+    }
+
+    private fun screenLeft(s: Session, failed: Boolean, error: Exception? = null) {
+        tvState = "STOPPED"
+        val name = tv?.name ?: ""
+        val src = s.source
+        val text = when {
+            error != null -> str(R.string.tv_didnt_accept, errorText(error))
+            failed -> str(R.string.screen_not_back)
+            src != null -> str(R.string.screen_left_source, name, src.name)
+            else -> str(R.string.screen_left, name)
+        }
+        showInfo(text, if (failed || error != null) Banner.Kind.WARNING else Banner.Kind.INFO, listOf(
+            BannerAction(str(R.string.show_again)) { showScreenAgain() },
+            BannerAction(str(R.string.stop_sharing)) { stop() },
+        ))
+        s.awayBanner = bannerId
+    }
+
+    /** Send the shared screen to the TV again, after the TV left it (the button, the banner, the notification). */
+    fun showScreenAgain() {
+        val s = session ?: return
+        val w = s.watch ?: return
+        if (!w.away || w.sentAt != null) return
+        w.sent()
+        if (s.awayBanner != 0 && banner?.id == s.awayBanner) banner = null
+        sendScreen(s)
+        updateStatus()
+    }
+
+    private fun sendScreen(s: Session) {
+        val t = tv ?: return
+        val g = s.gen
+        worker.execute {
+            val r = runCatching { playMedia(t, server, s.media) }
+            main.post {
+                poller.wake()
+                val e = r.exceptionOrNull()
+                if (e == null || session !== s || s.gen != g) return@post
+                s.watch?.sendFailed()
+                screenLeft(s, failed = true, error = e as? Exception ?: RuntimeException(e))
+                updateStatus()
+            }
+        }
+    }
 
     private fun stopScreen() {
         val cast = screen ?: return
@@ -1321,6 +1457,7 @@ class Engine(private val app: Context) {
             pollErrors += 1
             session?.let { it.answeringSince = 0.0 }
             if (pollErrors == 3) setStatusLine(str(R.string.cant_reach, t.name))
+            session?.let { s -> if (s.watch != null) followScreen(s, null, null) } // a TV that doesn't answer may still watch
             return
         }
         if (pollErrors >= 3) statusLine = str(R.string.connected_to, t.name)
@@ -1358,7 +1495,10 @@ class Engine(private val app: Context) {
             val arrived = ours && pos != null && s.seenPlaying && pos >= h.target - 2 && pos <= h.target + 8
             if (arrived || n - h.since > h.limit) hold = null
         }
-        if (s.seenPlaying && (state == "STOPPED" || state == "NO_MEDIA_PRESENT" || !ours)) {
+        if (s.watch != null) { // the shared screen: the TV leaving it doesn't end it
+            if (!s.seenPlaying && showingLive(s.media, state, r.uri)) s.seenPlaying = true // (from OpusCast among the TV's sources)
+            if (followScreen(s, state, r.uri)) return
+        } else if (s.seenPlaying && (state == "STOPPED" || state == "NO_MEDIA_PRESENT" || !ours)) {
             val pl = playlist
             if (s.kind == Kind.MUSIC && ours && pl != null && endedNaturally(s)) {
                 if (pl.index + 1 < pl.items.size) nextTrack() else endSession(stopTv = false)
@@ -1427,6 +1567,9 @@ class Engine(private val app: Context) {
         if (s.kind == Kind.INTRO && st == "PLAYING") text = str(R.string.skynet_online)
         if (s.kind == Kind.PHOTO) text = str(if (s.seenPlaying) R.string.showing else R.string.sending_photo)
         if (s.kind == Kind.SCREEN && st == "PLAYING") text = str(R.string.live)
+        val w = s.watch
+        if (w?.sentAt != null) text = str(R.string.showing_again)
+        else if (w?.away == true) text = str(R.string.not_on_tv)
         if (!s.seenPlaying && s.startError != null) text = str(R.string.waiting_tv)
         if (s.subLoading) text = str(R.string.loading_subtitles)
         val name = tv?.name
@@ -1463,6 +1606,10 @@ class Engine(private val app: Context) {
         gen += 1
         s.subCancel?.cancelled = true
         if (s.kind == Kind.SCREEN) stopScreen()
+        s.source?.let { src -> thread(isDaemon = true, name = "opuscast-source-stop") { src.close() } }
+        sourceLock?.let { runCatching { it.release() } }
+        sourceLock = null
+        if (s.awayBanner != 0 && banner?.id == s.awayBanner) banner = null // "it's still shared" isn't true any more
         if (s.kind == Kind.MUSIC || s.kind == Kind.PHOTO) leavePlaylist()
         if (s.kind == Kind.MOVIE && s.seenPlaying) {
             val pos = estPos()
@@ -1484,7 +1631,11 @@ class Engine(private val app: Context) {
             toggleSlideshow()
             return
         }
-        if (s == null || s.kind == Kind.SCREEN) return
+        if (s != null && s.kind == Kind.SCREEN) {
+            if (s.watch?.away == true) showScreenAgain()
+            return
+        }
+        if (s == null) return
         if (tvState == "PLAYING") {
             tvPos = estPos()
             tvState = "PAUSED_PLAYBACK"
@@ -1546,7 +1697,7 @@ class Engine(private val app: Context) {
             publish()
             return
         }
-        endSession(stopTv = true)
+        endSession(stopTv = session?.watch?.away != true) // a TV that left the screen shows something else now
     }
 
     /** Next / Previous (media buttons, lock screen, notification): song, photo, or 30 seconds in a video. */

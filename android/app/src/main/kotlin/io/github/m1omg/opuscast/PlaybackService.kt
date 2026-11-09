@@ -194,7 +194,7 @@ class PlaybackService : Service() {
         Intent(this, PlaybackService::class.java).setAction(name), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
     @Suppress("DEPRECATION") // the Icon-less Action.Builder: the resource-id one works on every Android version here
-    private fun notification(title: String, playing: Boolean, mode: PlayerMode): Notification {
+    private fun notification(title: String, playing: Boolean, mode: PlayerMode, away: Boolean = false): Notification {
         val tv = engine.tvNameNow
         fun act(icon: Int, label: Int, name: String, code: Int) =
             Notification.Action.Builder(icon, getString(label), action(name, code)).build()
@@ -205,7 +205,9 @@ class PlaybackService : Service() {
                 act(android.R.drawable.ic_media_previous, R.string.previous, ACTION_PREVIOUS, 5),
                 act(pause, if (mode == PlayerMode.PHOTO) R.string.slideshow else R.string.play_pause, ACTION_TOGGLE, 2),
                 act(android.R.drawable.ic_media_next, R.string.next, ACTION_NEXT, 6), stop)
-            PlayerMode.SCREEN -> listOf(stop)
+            // the TV left the screen (still shared): one tap shows it there again
+            PlayerMode.SCREEN -> if (away) listOf(act(android.R.drawable.ic_media_play, R.string.show_again, ACTION_TOGGLE, 2), stop)
+                else listOf(stop)
             PlayerMode.VIDEO, PlayerMode.INTRO -> listOf(
                 act(android.R.drawable.ic_media_rew, R.string.back_10, ACTION_BACK, 1),
                 act(pause, R.string.play_pause, ACTION_TOGGLE, 2),
@@ -229,7 +231,7 @@ class PlaybackService : Service() {
      *  projection (and recording what apps play) while the screen is cast. */
     private fun goForeground(title: String, playing: Boolean, screen: Boolean = engine.screenActive) {
         val mode = if (screen) PlayerMode.SCREEN else engine.ui.value.player?.mode ?: PlayerMode.VIDEO
-        val n = notification(title, playing, mode)
+        val n = notification(title, playing, mode, away = engine.ui.value.player?.away == true)
         var want = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0
         if (screen && Build.VERSION.SDK_INT >= 29) {
             want = want or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION

@@ -29,6 +29,12 @@ file to the TV over your Wi‑Fi (DLNA / UPnP), so the **TV remote works** for p
   (Android 10+, after you allow recording audio - it's only used for the apps' sound). Android asks
   every time whether to share the screen. Expect the TV to be a couple of seconds behind; choose
   720p in the options bar if your Wi‑Fi struggles.
+- **Left the phone's screen on the TV by mistake?** It stays shared, and the TV remote brings it back:
+  while you share, the phone is among the TV's sources as “OpusCast on *your phone*” (Samsung:
+  *Source*; LG, Philips and others: their media player), with the screen in it. Or tap *Show on the
+  TV again* in the app or the notification. With *Bring it back if the TV leaves* it comes back by
+  itself; leave it again right away and it stays off. Only the TV you share to sees your screen
+  there, and nobody watching for 30 minutes ends sharing.
 - **The phone's volume buttons set the TV's volume** while something plays. Lock-screen and
   Bluetooth media controls work too.
 - **Device list:** shows which devices on your network can play video, which play music only, and
