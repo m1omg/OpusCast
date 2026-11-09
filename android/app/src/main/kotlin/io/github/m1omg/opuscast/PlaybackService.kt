@@ -78,6 +78,7 @@ class PlaybackService : Service() {
     private var shownPlaying: Boolean? = null
     private var lastState: Triple<Int, Long, Long>? = null // (state, position ms, elapsedRealtime when set)
     private var shownMode: PlayerMode? = null
+    private var shownAgain: Boolean? = null
     private var shownArt: android.graphics.Bitmap? = null
     private var foreground = false
     /** The foreground service types it runs as now (screen capture adds media projection). */
@@ -94,7 +95,8 @@ class PlaybackService : Service() {
         })
         media = MediaSession(this, "OpusCast").apply {
             setCallback(object : MediaSession.Callback() {
-                override fun onPlay() { if (!engine.isPlaying) engine.togglePlay() }
+                // the TV left the shared screen: Play (the shade, the lock screen, a headset) shows it there again
+                override fun onPlay() { if (engine.screenAway) engine.showScreenAgain() else if (!engine.isPlaying) engine.togglePlay() }
                 override fun onPause() { if (engine.isPlaying) engine.togglePlay() }
                 override fun onStop() = engine.stop()
                 override fun onSeekTo(pos: Long) = engine.seekTo(pos / 1000.0)
@@ -194,7 +196,7 @@ class PlaybackService : Service() {
         Intent(this, PlaybackService::class.java).setAction(name), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
     @Suppress("DEPRECATION") // the Icon-less Action.Builder: the resource-id one works on every Android version here
-    private fun notification(title: String, playing: Boolean, mode: PlayerMode, away: Boolean = false): Notification {
+    private fun notification(title: String, playing: Boolean, mode: PlayerMode, again: Boolean = false): Notification {
         val tv = engine.tvNameNow
         fun act(icon: Int, label: Int, name: String, code: Int) =
             Notification.Action.Builder(icon, getString(label), action(name, code)).build()
@@ -206,7 +208,7 @@ class PlaybackService : Service() {
                 act(pause, if (mode == PlayerMode.PHOTO) R.string.slideshow else R.string.play_pause, ACTION_TOGGLE, 2),
                 act(android.R.drawable.ic_media_next, R.string.next, ACTION_NEXT, 6), stop)
             // the TV left the screen (still shared): one tap shows it there again
-            PlayerMode.SCREEN -> if (away) listOf(act(android.R.drawable.ic_media_play, R.string.show_again, ACTION_TOGGLE, 2), stop)
+            PlayerMode.SCREEN -> if (again) listOf(act(android.R.drawable.ic_media_play, R.string.show_again, ACTION_TOGGLE, 2), stop)
                 else listOf(stop)
             PlayerMode.VIDEO, PlayerMode.INTRO -> listOf(
                 act(android.R.drawable.ic_media_rew, R.string.back_10, ACTION_BACK, 1),
@@ -229,9 +231,10 @@ class PlaybackService : Service() {
 
     /** Foreground with the notification, as the kinds of service it is now: media playback, plus media
      *  projection (and recording what apps play) while the screen is cast. */
-    private fun goForeground(title: String, playing: Boolean, screen: Boolean = engine.screenActive) {
+    private fun goForeground(title: String, playing: Boolean, screen: Boolean = engine.screenActive,
+                             again: Boolean = showAgain(engine.ui.value.player)) {
         val mode = if (screen) PlayerMode.SCREEN else engine.ui.value.player?.mode ?: PlayerMode.VIDEO
-        val n = notification(title, playing, mode, away = engine.ui.value.player?.away == true)
+        val n = notification(title, playing, mode, again)
         var want = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0
         if (screen && Build.VERSION.SDK_INT >= 29) {
             want = want or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
@@ -255,7 +258,11 @@ class PlaybackService : Service() {
         shownTitle = title
         shownPlaying = playing
         shownMode = mode
+        shownAgain = again
     }
+
+    /** The TV left the shared screen, which is still shared (and isn't being sent there again right now). */
+    private fun showAgain(p: PlayerUi?) = p != null && p.mode == PlayerMode.SCREEN && p.away && !p.sendingAgain
 
     private fun metadata(ui: UiState, p: PlayerUi, clock: Clock) {
         val b = MediaMetadata.Builder()
@@ -275,16 +282,26 @@ class PlaybackService : Service() {
         }
         val p = ui.player ?: return
         val title = p.title
-        // photos don't play: what shows as playing is the slideshow
-        val playing = if (p.mode == PlayerMode.PHOTO) p.slideshow else p.playing
-        if (title != shownTitle || playing != shownPlaying || p.mode != shownMode) {
-            goForeground(title, playing)
+        // photos don't play: what shows as playing is the slideshow; the shared screen plays while the TV shows it
+        val playing = when (p.mode) {
+            PlayerMode.PHOTO -> p.slideshow
+            PlayerMode.SCREEN -> p.playing && !p.away
+            else -> p.playing
+        }
+        // the TV left the shared screen a few seconds after it stopped playing there: then the notification
+        // offers to show it on the TV again
+        val again = showAgain(p)
+        if (title != shownTitle || playing != shownPlaying || p.mode != shownMode || again != shownAgain) {
+            goForeground(title, playing, again = again)
             metadata(ui, p, clock)
         } else if (p.art !== shownArt) {
             metadata(ui, p, clock)
         }
-        // the system moves the position along by itself; tell it again only when it's off (seek, pause)
-        val state = if (playing) PlaybackState.STATE_PLAYING else if (p.seekable || p.mode == PlayerMode.PHOTO) PlaybackState.STATE_PAUSED
+        // Android 13+ draws the shade's and the lock screen's controls from this state, not from the notification's
+        // buttons: while the TV is away from the shared screen, Play there shows it on the TV again.
+        // The system moves the position along by itself; tell it again only when it's off (seek, pause).
+        val state = if (playing) PlaybackState.STATE_PLAYING
+            else if (again || p.seekable || p.mode == PlayerMode.PHOTO) PlaybackState.STATE_PAUSED
             else PlaybackState.STATE_BUFFERING
         val posMs = if (p.mode == PlayerMode.PHOTO || p.mode == PlayerMode.SCREEN) PlaybackState.PLAYBACK_POSITION_UNKNOWN else (clock.pos * 1000).toLong()
         val nowMs = SystemClock.elapsedRealtime()
@@ -298,7 +315,8 @@ class PlaybackService : Service() {
                     PlaybackState.ACTION_SKIP_TO_PREVIOUS
                 PlayerMode.PHOTO -> PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
                     PlaybackState.ACTION_STOP or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
-                PlayerMode.SCREEN -> PlaybackState.ACTION_STOP
+                PlayerMode.SCREEN -> if (again) PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP
+                    else PlaybackState.ACTION_STOP
                 PlayerMode.VIDEO, PlayerMode.INTRO -> PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_PLAY or
                     PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_STOP or
                     PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND

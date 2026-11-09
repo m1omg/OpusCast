@@ -1122,6 +1122,8 @@ class Engine(private val app: Context) {
     }
 
     val screenActive: Boolean get() = screen != null
+    /** The TV left the shared screen (it's still shared): [showScreenAgain] brings it back. */
+    val screenAway: Boolean get() = session?.watch?.away == true
 
     fun setScreenBringBack(on: Boolean) {
         settings.screenBringBack = on
