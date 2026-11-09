@@ -145,7 +145,7 @@ class TvSource(
     private val send: MulticastSocket? = runCatching {
         MulticastSocket().apply {
             timeToLive = 2
-            runCatching { `interface` = InetAddress.getByName(ip) }
+            runCatching { networkInterface = NetworkInterface.getByInetAddress(InetAddress.getByName(ip)) }
         }
     }.getOrNull()
     /** The TV's searches go to port 1900, which other UPnP apps may use too (shared). Without it, the
