@@ -1492,7 +1492,7 @@ class Engine(private val app: Context) {
         }
         if (pollErrors >= 3) statusLine = str(R.string.connected_to, t.name)
         pollErrors = 0
-        if (r.volume != null && now() - volTouched > 3) volume = shownVolume(r.volume)
+        r.volume?.let { if (now() - volTouched > 3) volume = shownVolume(it) }
         val s = session
         if (s == null) {
             publish()
