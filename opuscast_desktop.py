@@ -479,6 +479,11 @@ class _PipeWireFrames:
 
 # ---------------------------------------------------------------- one cast
 
+# Evening out the PC's sound on its way to the TV (it's encoded anyway): loud parts 3:1 above -20 dBFS,
+# everything 5 dB up, and a limiter so nothing clips.
+COMPRESSOR = ("acompressor=threshold=0.1:ratio=3:attack=10:release=300:knee=4:makeup=1.78,"
+              "alimiter=limit=0.95:attack=5:release=50:level=false")
+
 class DesktopCast:
     """Captures the screen (and sound) into a LiveStream the media server hands to the TV.
 
@@ -487,11 +492,12 @@ class DesktopCast:
     called if capturing stops by itself (the user stopped sharing, ffmpeg died...). Both may be
     called from another thread."""
 
-    def __init__(self, height=1080, fps=30, sound=True, area=None, restore_token=None, screen=None):
+    def __init__(self, height=1080, fps=30, sound=True, area=None, restore_token=None, screen=None, even=False):
         self.width, self.height = SIZES.get(height, SIZES[1080])
         # area: X11/Windows (x, y, width, height) in real pixels, None for everything; screen: macOS's
         # screen number ("Capture screen N"), None for the main one
         self.fps, self.want_sound, self.area, self.screen = fps, sound, area, screen
+        self.even = even  # even out the sound (a compressor in the encoding it goes through anyway)
         self.loopback = None
         self.restore_token = restore_token  # Wayland: the portal's "remember this screen"
         self.live = core.LiveStream()
@@ -506,7 +512,7 @@ class DesktopCast:
     # what the window shows
     def describe(self):
         bits = [f"{self.height}p", f"{self.fps} fps", encoder_label(self.encoder)]
-        bits.append(_("with sound") if self.sound else _("no sound"))
+        bits.append((_("with even sound") if self.even else _("with sound")) if self.sound else _("no sound"))
         return " · ".join(bits)
 
     def start(self, done):
@@ -544,7 +550,8 @@ class DesktopCast:
             raise core.TVError(_("ffmpeg here can't encode video"))
         self.sound = sound_source() if self.want_sound else None
         pre, vf, venc = encoder_args(self.encoder, dev, self.fps, self.height)
-        out = ["-map", "0:v:0", "-map", audio_map, *venc, "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+        even = ["-af", COMPRESSOR] if self.even and self.sound else []
+        out = ["-map", "0:v:0", "-map", audio_map, *venc, *even, "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
                "-ac", "2", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0",
                "-muxpreload", "0", "-flush_packets", "1", "pipe:1"]
         return pre, vf, out

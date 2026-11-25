@@ -22,6 +22,12 @@ No apps on the TV, no servers to set up. OpusCast hands the file to the TV over 
   the window (Enter in the command line). With *Bring it back if the TV leaves* (desktop options,
   `--bring-back`) it comes back by itself; leave it again right away and it stays off. Only the TV you
   share to sees your desktop there, and nobody watching for 30 minutes ends sharing.
+- **Even out the sound:** loud scenes quieter, quiet ones a little louder, without touching the file.
+  OpusCast reads the sound's loudness ahead on the PC (ffmpeg decodes it; nothing is re-encoded) and
+  rides the TV's own volume: down a moment before an explosion, slowly back up after it. Set the volume
+  as usual, here or on the TV remote, and that's the level it evens out around (and it's back on the TV
+  when you stop). Videos and music; for the desktop, its sound goes through a compressor instead
+  (`--even-sound` in the command line).
 - **Picks up where you left off.** Recent videos remember their position and their subtitles.
 - **Subtitles from the PC:** subtitle files next to the video and text subtitles inside it.
   Switch them or turn them off while the movie plays; on Samsung TVs this happens instantly.

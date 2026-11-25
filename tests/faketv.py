@@ -39,6 +39,8 @@ class FakeTV:
         self.st = {"uri": "", "state": "NO_MEDIA_PRESENT", "since": 0.0, "dur": 0, "busy": False, "kind": None,
                    "gen": 0}
         self.didl, self.fetched, self.log = [], [], []
+        self.volume = 20
+        self.volumes = []  # (t, volume) for every SetVolume
         self.pulling = None  # the media server item the TV's own player shows
         self.served_from = []  # where the PC's media server is (for pick_from_sources' fallback)
         self.t0 = time.monotonic()
@@ -204,7 +206,7 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         action = self.headers.get("SOAPACTION", "").split("#")[-1].strip('"')
         out = ""
-        if action not in ("GetTransportInfo", "GetPositionInfo", "GetVolume", "GetProtocolInfo"):
+        if action not in ("GetTransportInfo", "GetPositionInfo", "GetVolume", "GetProtocolInfo", "SetVolume"):
             tv.log.append((tv.t(), action))
         if st["state"] == "PLAYING" and st["kind"] == "audio" and time.monotonic() - st["since"] >= st["dur"]:
             st["state"] = "STOPPED"  # the song ended
@@ -245,8 +247,11 @@ class _Handler(BaseHTTPRequestHandler):
         elif action == "GetPositionInfo":
             pos = int(time.monotonic() - st["since"]) if st["state"] == "PLAYING" else 0
             dur = f"0:00:{st['dur']:02d}" if st["kind"] == "audio" else "0:00:00"
-            out = (f"<TrackDuration>{dur}</TrackDuration><RelTime>0:00:{pos:02d}</RelTime>"
+            out = (f"<TrackDuration>{dur}</TrackDuration><RelTime>{pos // 3600}:{pos // 60 % 60:02d}:{pos % 60:02d}</RelTime>"
                    f"<TrackURI>{html.escape(st['uri'])}</TrackURI>")
         elif action == "GetVolume":
-            out = "<CurrentVolume>20</CurrentVolume>"
+            out = f"<CurrentVolume>{tv.volume}</CurrentVolume>"
+        elif action == "SetVolume":
+            tv.volume = int(re.search(r"<DesiredVolume>(\d+)<", body).group(1))
+            tv.volumes.append((tv.t(), tv.volume))
         self.reply(200, f"<s:Envelope><s:Body><u:{action}Response>{out}</u:{action}Response></s:Body></s:Envelope>")

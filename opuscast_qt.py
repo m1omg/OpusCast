@@ -339,6 +339,7 @@ class OpusCastWindow(QMainWindow):
         self.events_pending = False  # a SUBSCRIBE is on its way
         self.play_icon = "play"
         self.worker = Worker(self._on_worker_error)
+        self.leveler = None  # evens out the sound (core.Leveler), made when first needed
         self.preview = Preview(self._on_preview_error)
         self.seek_timer = self._timer(350, lambda: self.seek_to(self.slider.value() / 10))
         self.vol_timer = self._timer(150, self._send_volume)
@@ -628,8 +629,14 @@ class OpusCastWindow(QMainWindow):
         self.intro_switch.setToolTip(_("Play the Skynet boot animation before each video"))
         self.intro_switch.setChecked(bool(self.cfg.get("intro")) and intro.available()[0])
         self.intro_switch.toggled.connect(self._on_intro_toggled)
+        self.even_switch = QCheckBox(_("Even out the sound"))
+        self.even_switch.setToolTip(_("Loud scenes quieter, quiet ones louder: OpusCast reads the loudness ahead and "
+                                      "rides the TV's volume (the file isn't changed or re-encoded)"))
+        self.even_switch.setChecked(bool(self.cfg.get("even_sound")) and core.Leveler.available())
+        self.even_switch.toggled.connect(self._on_even_toggled)
         row.addWidget(self.preview_switch)
         row.addWidget(self.intro_switch)
+        row.addWidget(self.even_switch)
         row.addStretch(1)
         row.addWidget(label(_("Keep OpusCast open while you watch"), "dim"))
         return bar
@@ -819,9 +826,7 @@ class OpusCastWindow(QMainWindow):
             return
         now = time.monotonic()
         if "Volume" in changes and changes["Volume"].isdigit() and now - self.vol_touched > 3:
-            self.setting_vol = True
-            self.volume.setValue(int(changes["Volume"]))
-            self.setting_vol = False
+            self._show_volume(int(changes["Volume"]))
         s = self.session
         if "X_EnabledCaptions" in changes:
             self.last_caption_event = now
@@ -1196,6 +1201,7 @@ class OpusCastWindow(QMainWindow):
         if not self.event_sids and not self.events_pending:  # e.g. the TV didn't answer until it was allowed
             self._subscribe_events(self.tv)
         self._start_on_tv(self.session)
+        self._level_follow()
         after(15000, self._check_fetched, gen)
         if kind == "movie" and subs is None:
             def find():
@@ -1395,9 +1401,7 @@ class OpusCastWindow(QMainWindow):
             self._set_subtitle(_("Connected to {tv}").format(tv=self.tv.name))
         self.poll_errors = 0
         if r.get("volume") is not None and time.monotonic() - self.vol_touched > 3:
-            self.setting_vol = True
-            self.volume.setValue(int(r["volume"]))
-            self.setting_vol = False
+            self._show_volume(int(r["volume"]))
         s = self.session
         if not s:
             return
@@ -1419,6 +1423,8 @@ class OpusCastWindow(QMainWindow):
                 if dur:
                     self.tv_dur = float(dur)
                 self.tv_state = state
+        if self.leveler:
+            self.leveler.saw(pos if current else None, current and state == "PLAYING" and s["seen_playing"])
         if self.hold:
             target, since, limit = self.hold
             arrived = current and pos is not None and s["seen_playing"] and target - 2 <= pos <= target + 8
@@ -1527,6 +1533,8 @@ class OpusCastWindow(QMainWindow):
             return
         self.poller.active = False
         self.gen += 1
+        if self.leveler:
+            self.leveler.unfollow()  # the user's volume back on the TV
         if s["kind"] == "movie" and s["seen_playing"]:
             pos, dur = self.est_pos(), self.tv_dur
             watched = bool(dur) and (pos >= dur - 90 or pos >= dur * 0.95)
@@ -1912,7 +1920,8 @@ class OpusCastWindow(QMainWindow):
         self._show_player(_("Your desktop"), _("Choose what to show in the window that opens…") if kind == "wayland"
                           else _("Starting the screen capture…"))
         screen = self.cfg.get("desk_screen")
-        cast = desk.DesktopCast(height=int(self.cfg.get("desk_height", 1080)), fps=int(self.cfg.get("desk_fps", 30)),
+        cast = desk.DesktopCast(even=self.even_switch.isChecked(),
+                                height=int(self.cfg.get("desk_height", 1080)), fps=int(self.cfg.get("desk_fps", 30)),
                                 sound=bool(self.cfg.get("desk_sound", True)),
                                 area=self._cast_area() if kind in ("x11", "windows") else None,
                                 restore_token=self.cfg.get("portal_token"),
@@ -2267,8 +2276,42 @@ class OpusCastWindow(QMainWindow):
         self.vol_timer.start()
 
     def _send_volume(self):
-        if self.tv:
+        if self.leveler and self.leveler.active:
+            self.leveler.set_base(self.volume.value())  # the level it evens out around
+        elif self.tv:
             self.worker.submit(self.tv.set_volume, self.volume.value())
+
+    def _show_volume(self, volume):
+        """The TV's volume - or, while the sound is evened out, the user's own (the TV's follows the sound)."""
+        if self.leveler:
+            volume = self.leveler.observed(volume)
+        self.setting_vol = True
+        self.volume.setValue(int(volume))
+        self.setting_vol = False
+
+    # ------------------------------------------------------------ evening out the sound
+
+    def _on_even_toggled(self, on):
+        if on and not core.Leveler.available():
+            self.even_switch.setChecked(False)
+            self.show_info(_("Evening out the sound needs ffmpeg."), WARNING)
+            return
+        self.cfg["even_sound"] = on
+        self._save()
+        s = self.session
+        if s and s["kind"] == "desktop" and s.get("cast"):
+            self.show_info(_("The desktop's sound is evened out from the next time you cast it."))
+        self._level_follow(self.est_pos() if s else None)
+
+    def _level_follow(self, start=None):
+        """Even out what plays now (videos and songs), or let go of the TV's volume."""
+        s = self.session
+        if s and self.tv and s["kind"] in ("movie", "music") and s["path"] and self.even_switch.isChecked():
+            if self.leveler is None:
+                self.leveler = core.Leveler()
+            self.leveler.follow(self.tv, s["path"], s["start_at"] if start is None else start)
+        elif self.leveler:
+            self.leveler.unfollow()
 
     # ------------------------------------------------------------ preview
 
@@ -2416,8 +2459,11 @@ class OpusCastWindow(QMainWindow):
     def closeEvent(self, event):  # noqa: N802 - Qt's name
         s, tv = self.session, self.tv
         sids = dict(self.event_sids)
+        lev = self.leveler
 
         def shutdown():
+            if lev:
+                lev.close(wait=True)  # the user's volume back on the TV
             if s:
                 self._quietly(tv.stop, timeout=2.5)
             for service, sid in sids.items():

@@ -397,6 +397,23 @@ SK = {
     "Nobody watched the desktop for 30 minutes, so OpusCast stopped sharing it.":
         "Plochu 30 minút nikto nesledoval, preto sa jej zdieľanie skončilo.",
     "Bring it back if the TV leaves": "Vrátiť plochu, keď ju televízor opustí",
+    # evening out the sound
+    "Even out the sound": "Vyrovnať zvuk",
+    "Loud scenes quieter, quiet ones louder: OpusCast reads the loudness ahead and rides the TV's volume "
+    "(the file isn't changed or re-encoded)":
+        "Hlasné scény tichšie, tiché hlasnejšie: OpusCast vopred zistí hlasitosť a podľa nej mení hlasitosť "
+        "televízora (súbor sa nemení ani neprekóduje)",
+    "Evening out the sound needs ffmpeg.": "Na vyrovnanie zvuku treba ffmpeg.",
+    "Evening out the sound needs ffmpeg. Install it with:": "Na vyrovnanie zvuku treba ffmpeg. Nainštalujte ho:",
+    "Evening out the sound needs ffmpeg:": "Na vyrovnanie zvuku treba ffmpeg:",
+    "Evening out the sound: the TV's volume follows the loudness (set the volume as usual).":
+        "Zvuk sa vyrovnáva: hlasitosť televízora sa riadi hlasitosťou zvuku (hlasitosť nastavujte ako zvyčajne).",
+    "The desktop's sound is evened out from the next time you cast it.":
+        "Zvuk plochy sa bude vyrovnávať od ďalšieho zdieľania.",
+    "even out the sound: loud scenes quieter, quiet ones louder (nothing is re-encoded)":
+        "vyrovnať zvuk: hlasné scény tichšie, tiché hlasnejšie (nič sa neprekóduje)",
+    "ffmpeg can't read this file's sound": "ffmpeg nevie prečítať zvuk tohto súboru",
+    "with even sound": "s vyrovnaným zvukom",
     "If the TV leaves the desktop (Back, another source…), OpusCast shows it there again after a few seconds. "
     "Leave it again right away to keep it off.":
         "Keď televízor plochu opustí (tlačidlo Späť, iný zdroj…), OpusCast ju tam o pár sekúnd znova ukáže. "

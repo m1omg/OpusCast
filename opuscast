@@ -12,6 +12,8 @@
   opuscast --desktop              show this PC's screen and sound on the TV (--size 720, --fps 60,
                                   --screen 2, --no-sound, --bring-back); if the TV leaves it, it's
                                   still shared: OpusCast is among the TV's sources, or press Enter
+  ... --even-sound                even out the sound: loud scenes quieter, quiet ones louder (the
+                                  TV's volume follows the file's loudness; nothing is re-encoded)
   opuscast --list                 show devices on the network and which can play video
   opuscast --stop                 stop whatever the TV is playing
 """
@@ -48,7 +50,7 @@ def start(tv, server, path, start_at=0, subtitle=None, media_obj=None):
     return item
 
 
-def wait_until_done(tv, server, item, quiet=False):
+def wait_until_done(tv, server, item, quiet=False, leveler=None):
     """Follow the TV until it's done. Returns None if it never started, else True when it played to
     the end and False when it was stopped half-way (or something else is on the TV now)."""
     seen, last, start_time, warned = False, None, time.time(), False
@@ -75,6 +77,8 @@ def wait_until_done(tv, server, item, quiet=False):
         except core.TVError:
             state, uri, answering, now_pos, now_dur = "UNREACHABLE", None, None, None, None
         ours = not uri or item["url_path"] in uri
+        if leveler:
+            leveler.saw(now_pos if ours else None, ours and state == "PLAYING")
         if ours and state == "PLAYING":
             pos, dur = now_pos if now_pos is not None else pos, now_dur or dur
         if item.get("start_error") is not None and not seen and not retried and answering \
@@ -145,7 +149,7 @@ def pick_subtitle(video, choice):
     sys.exit(_("No such subtitle file: {path}").format(path=choice))
 
 
-def play_songs(tv, server, songs):
+def play_songs(tv, server, songs, leveler=None):
     """One after another; stops when a song is stopped half-way on the TV."""
     for n, path in enumerate(songs, 1):
         tags = media.audio_tags(path)
@@ -163,9 +167,11 @@ def play_songs(tv, server, songs):
         if cover:
             song["meta"]["cover_path"], song["meta"]["cover_mime"] = server.add_extra(song, *cover), cover[0]
         start(tv, server, play, media_obj=song)
+        if leveler:
+            leveler.follow(tv, path)
         line = " · ".join(x for x in (song["title"], media.song_line(tags)) if x)
         print(f"[{n}/{len(songs)}] {line}")
-        result = wait_until_done(tv, server, song, quiet=True)
+        result = wait_until_done(tv, server, song, quiet=True, leveler=leveler)
         if result is None:
             return False
         if result is False:
@@ -217,7 +223,7 @@ def cast_desktop(tv, server, cfg, a):
         if pick:
             area = pick[1:5]
     cast = desk.DesktopCast(height=a.size, fps=a.fps, sound=not a.no_sound, area=area,
-                            restore_token=cfg.get("portal_token"))
+                            restore_token=cfg.get("portal_token"), even=a.even_sound)
     loop = None
     if desk.session_kind() == "wayland":  # the screen-cast portal answers through a GLib main loop
         from gi.repository import GLib
@@ -352,6 +358,8 @@ def main():
     ap.add_argument("--bring-back", action="store_true",
                     help=_("desktop: if the TV leaves it, show it there again by itself (leave it twice in a row "
                            "to stop)"))
+    ap.add_argument("--even-sound", action="store_true",
+                    help=_("even out the sound: loud scenes quieter, quiet ones louder (nothing is re-encoded)"))
     ap.add_argument("--list", action="store_true", help=_("show devices on the network and which can play video"))
     ap.add_argument("--stop", action="store_true", help=_("stop playback on the TV and exit"))
     a = ap.parse_args()
@@ -405,13 +413,20 @@ def main():
             device=tv.name))
 
     server = core.MediaServer()
+    leveler = None
+    if a.even_sound and not a.desktop and kind != "image":
+        if core.Leveler.available():
+            leveler = core.Leveler()
+            print(_("Evening out the sound: the TV's volume follows the loudness (set the volume as usual)."))
+        else:
+            print(_("Evening out the sound needs ffmpeg:") + " " + core.install_hint(["subs"]))
     try:
         if a.desktop:
             cast_desktop(tv, server, cfg, a)
             print(_("Finished."))
             return
         if kind == "audio":
-            if not play_songs(tv, server, files):
+            if not play_songs(tv, server, files, leveler):
                 sys.exit(1)
             print(_("Finished."))
             return
@@ -425,10 +440,12 @@ def main():
             wait_until_done(tv, server, start(tv, server, opuscast_intro.ensure_intro()))
         for n, video in enumerate(files):
             item = start(tv, server, video, start_at if n == 0 else 0, subtitle=subtitle if n == 0 else None)
+            if leveler:
+                leveler.follow(tv, os.path.abspath(video), start_at if n == 0 else 0)
             print(_("Playing on {tv}: {title}").format(tv=tv.name, title=item["title"]))
             if n == 0:
                 print(_("(keep this open while you watch - Ctrl+C stops)"))
-            result = wait_until_done(tv, server, item)
+            result = wait_until_done(tv, server, item, leveler=leveler)
             if result is None:
                 sys.exit(1)
             if result is False:
@@ -443,6 +460,8 @@ def main():
     except (core.TVError, RuntimeError, OSError) as e:
         sys.exit(_("Error: {error}").format(error=e))
     finally:
+        if leveler:
+            leveler.close(wait=True)  # the user's volume back on the TV
         server.close()
 
 
