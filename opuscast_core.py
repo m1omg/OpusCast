@@ -2316,8 +2316,12 @@ class Leveler:
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-ss", f"{start:.3f}",
                "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", "aresample=24000,ebur128=framelog=info",
                "-f", "null", "-"]
-        kw = {"creationflags": 0x08004000} if sys.platform == "win32" else {"preexec_fn": lambda: os.nice(10)}
-        try:  # (Windows: no console window, below normal priority; elsewhere: nice 10)
+        kw = {}
+        if sys.platform == "win32":
+            kw["creationflags"] = 0x08004000  # no console window, below normal priority
+        elif have("nice"):
+            cmd = ["nice", "-n", "10", *cmd]
+        try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1, **kw)
         except OSError as e:
