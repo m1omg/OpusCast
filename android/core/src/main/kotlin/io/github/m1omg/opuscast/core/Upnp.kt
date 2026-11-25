@@ -92,7 +92,7 @@ internal fun captionEntries(xml: String?): List<CaptionEntry> =
 fun captionUris(xml: String?): List<String> = captionEntries(xml).mapNotNull { it["uri"] }
 
 /** A DLNA media renderer (a TV). */
-class Tv(info: DeviceInfo) {
+class Tv(info: DeviceInfo) : VolumeControl {
     val location = info.location
     val host = info.host
     val name = info.name.ifEmpty { "TV" }
@@ -187,11 +187,11 @@ class Tv(info: DeviceInfo) {
     }
 
     // volume, 0-100
-    fun getVolume(): Int? =
+    override fun getVolume(): Int? =
         xmlTag(soap("RenderingControl", "GetVolume", listOf("InstanceID" to 0, "Channel" to "Master"), 4000),
             "CurrentVolume")?.toIntOrNull()
 
-    fun setVolume(value: Int) {
+    override fun setVolume(value: Int) {
         soap("RenderingControl", "SetVolume", listOf("InstanceID" to 0, "Channel" to "Master", "DesiredVolume" to value.coerceIn(0, 100)))
     }
 

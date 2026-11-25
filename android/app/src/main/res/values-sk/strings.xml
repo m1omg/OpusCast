@@ -166,5 +166,7 @@
     <string name="screen_idle">Obrazovku telefónu 30 minút nikto nesledoval, preto sa jej zdieľanie skončilo.</string>
     <string name="screen_back_hint">V televízore sa vrátite výberom „%1$s“ medzi jeho zdrojmi.</string>
     <string name="screen_source_hint">Ak v televízore omylom odídete z obrazovky, vráťte sa výberom „%1$s“ medzi zdrojmi televízora.</string>
+    <string name="even_sound">Vyrovnať zvuk</string>
+    <string name="even_screen_next_time">Zvuk telefónu sa bude vyrovnávať od ďalšieho zdieľania obrazovky.</string>
     <string name="bring_back">Vrátiť obrazovku, keď ju televízor opustí</string>
 </resources>

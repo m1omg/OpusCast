@@ -205,6 +205,42 @@ def desktop_checks(env, tv):
     cli.stop()
 
 
+def level_curve_checks():
+    """The decisions of the sound leveler on made-up loudness: speech, a loud scene, a whisper."""
+    c = core.LevelCurve()
+    for i in range(600):  # a minute: speech at -24 LUFS, 40-43 s an explosion at -8, 50-56 s a whisper at -38
+        t = i / 10
+        c.add(t, -8.0 if 40 <= t < 43 else -38.0 if 50 <= t < 56 else -60.5 if 20 <= t < 21 else -24.0)
+    check(c.level == -24.0, f"the programme's level is its speech ({c.level}), not its loud scene")
+    check(c.target(10) == 0.0, "speech stays as it is")
+    check(c.target(38.9) < -9, "turned down already a moment before the explosion")
+    check(abs(c.target(41) + (16 - c.THRESHOLD) * (1 - 1 / c.RATIO)) < 0.01, "the explosion 3:1 above the threshold")
+    check(0 < c.target(53) <= c.BOOST, "the whisper turned up a little")
+    check(c.target(20.5) == 0.0, "a pause isn't turned up")
+    g = [c.step(t / 10, 0.1) for t in range(380, 480)]
+    check(min(g) < -9 and min(g) < g[65] < 0 and g[-1] == 0, "after the explosion it comes back up slowly")
+    check(core.volume_for(20, 0) == 20 and core.volume_for(20, -10) == 10 and core.volume_for(20, 6) == 30
+          and core.volume_for(0, 6) == 0, "volumes: 10 dB is half or double the number, muted stays muted")
+
+
+def even_sound_checks(env, tv, media):
+    """opuscast --even-sound on a video with a loud scene: the TV is turned down for it, up again after,
+    and the user's volume is back at the end."""
+    clip = os.path.join(media, "loud scene.mp4")
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=16", "-f", "lavfi", "-i", "sine=f=300:r=48000:d=16",
+           "-af", "volume='if(between(t,7,10),8,1)':eval=frame", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-shortest", clip)
+    tv.volume, tv.volumes = 20, []
+    threading.Timer(15, tv.leave).start()  # the video's end
+    code, out = run_cli(env, ["--even-sound", clip], seconds=60)
+    played = [v for t, v in tv.volumes]
+    print("    volumes:", tv.volumes, flush=True)
+    check(code == 0 and "Evening out the sound" in out, "the command evened out the sound")
+    check(played and min(played) <= 13, "the TV was turned down for the loud scene")
+    check(played and max(played) <= 21, "speech wasn't turned up")
+    check(tv.volume == 20, "the user's volume is back on the TV at the end")
+
+
 def main():
     work = tempfile.mkdtemp(prefix="opuscast-smoke-")
     media = os.path.join(work, "media")
@@ -245,6 +281,9 @@ def main():
           "the TV could fetch the photos")
 
     tv_source_checks(tv)
+    print("evening out the sound", flush=True)
+    level_curve_checks()
+    even_sound_checks(env, tv, media)
     if "--desktop" in sys.argv:
         desktop_checks(env, tv)
     tv.close()

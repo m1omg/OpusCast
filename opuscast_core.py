@@ -10,6 +10,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -2076,6 +2077,351 @@ class ShareWatch:
     def send_failed(self):
         """Sending it again failed at once (the TV didn't answer)."""
         self.sent_at, self.away = None, True
+
+
+# ---------------------------------------------------------------- evening out the sound
+
+class LevelCurve:
+    """How much quieter or louder the TV should be at a moment of a programme, from its loudness read
+    ahead (EBU R128 momentary loudness, one value per 0.1 s). Loud moments above the programme's own
+    level are turned down 3:1, long quiet passages up a little (at most 6 dB); silence doesn't count.
+    The volume goes down a moment before something loud starts (the loudness is known ahead) and comes
+    back up slowly. The same rules as Leveler.kt on Android."""
+
+    STEP = 0.1  # s per loudness value
+    THRESHOLD = 2.0  # LU above the programme's level before it's turned down
+    RATIO = 3.0
+    QUIET = -10.0  # LU under the programme's level: turned up
+    LIFT = 0.5  # dB up per LU quieter than that
+    BOOST = 6.0  # dB up at most
+    CUT = 18.0  # dB down at most
+    SILENCE = -60.0  # LUFS: pauses don't count
+    LOOKAHEAD = 1.2  # s: down already this long before a loud moment (the TV and its clock lag)
+    LOOKBACK = 0.6  # s
+    RELEASE = 2.5  # dB per second back up
+
+    def __init__(self):
+        self.loud = {}  # index (time / STEP) -> momentary loudness, LUFS
+        self.hist = {}  # loudness in 0.5 LU bins -> count, for the programme's level
+        self.level = None
+        self._counted = 0
+        self.gain = 0.0
+
+    def add(self, t, lufs):
+        """Momentary loudness at t seconds (the middle of its 0.4 s window)."""
+        i = round(t / self.STEP)
+        if i in self.loud:
+            return
+        self.loud[i] = lufs
+        if lufs > self.SILENCE:
+            b = round(lufs * 2)
+            self.hist[b] = self.hist.get(b, 0) + 1
+            self._counted += 1
+            if self._counted < 200 or self._counted % 50 == 0:
+                self.level = self._level()
+
+    def _level(self):
+        """The programme's own level: the median loudness of what isn't silence - mostly speech in a film,
+        and not pulled up by its loud scenes."""
+        total = sum(c for b, c in self.hist.items() if b / 2 > self.SILENCE)
+        if total < 20:
+            return None
+        half = total / 2
+        for b in sorted(self.hist):
+            if b / 2 <= self.SILENCE:
+                continue
+            half -= self.hist[b]
+            if half <= 0:
+                return b / 2
+        return None
+
+    def covers(self, t):
+        return round(t / self.STEP) in self.loud
+
+    def curve(self, rel):
+        """dB for loudness rel LU above (+) or under (-) the programme's level."""
+        if rel > self.THRESHOLD:
+            return -min(self.CUT, (rel - self.THRESHOLD) * (1 - 1 / self.RATIO))
+        if rel < self.QUIET:
+            return min(self.BOOST, (self.QUIET - rel) * self.LIFT)
+        return 0.0
+
+    def target(self, pos):
+        """dB wanted at pos seconds, None when nothing around it is known (yet)."""
+        if self.level is None:
+            return None
+        lo, hi = round((pos - self.LOOKBACK) / self.STEP), round((pos + self.LOOKAHEAD) / self.STEP)
+        gains = [self.curve(v - self.level) for v in (self.loud.get(i) for i in range(lo, hi + 1))
+                 if v is not None and v > self.SILENCE]
+        return min(gains) if gains else None
+
+    def step(self, pos, dt):
+        """Moves self.gain towards the target at pos, dt seconds after the last step: down at once (the
+        look-ahead already started it early), up at RELEASE dB a second. Returns the gain."""
+        want = self.target(pos)
+        if want is None:
+            want = 0.0 if self.gain > 0 else self.gain  # unknown: no boost, hold a cut
+        if want < self.gain:
+            self.gain = want
+        else:
+            self.gain = min(want, self.gain + self.RELEASE * max(0.0, dt))
+        return self.gain
+
+
+def volume_for(base, gain):
+    """The TV's volume for the user's volume base changed by gain dB. TV volume steps follow the ear,
+    roughly: 10 dB is twice (or half) the number."""
+    if not base:
+        return 0
+    return max(1, min(100, round(base * 2 ** (gain / 10))))
+
+
+_LOUD_LINE = re.compile(r"\bt:\s*([0-9.]+)\s.*?\bM:\s*(-?[0-9.]+)")
+
+
+class Leveler:
+    """Evens out the sound of what the TV plays without touching the file: ffmpeg reads the sound's
+    loudness here, well ahead of the TV (it decodes it and nothing more - nothing is re-encoded or sent),
+    and OpusCast turns the TV's own volume down a moment before loud scenes and a little up in quiet
+    ones (LevelCurve). The user's volume stays the user's: what they set (here or on the remote) is the
+    level everything is measured from, and it's back on the TV when the leveler lets go.
+
+    The window or the command line tells it what plays (follow / unfollow), where the TV is (saw: the
+    position as the TV reports it) and the volume the TV reports (observed: returns the user's volume to
+    show). Its own thread sends the volume, at most twice a second."""
+
+    TICK = 0.2
+    MIN_GAP = 0.5  # s between volume commands
+    OWN = 4.0  # s: a volume the TV reports this soon after we set it is ours
+
+    def __init__(self, tv=None):
+        self.tv, self.base = tv, None
+        self.path = None
+        self.curve = LevelCurve()
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.proc = None
+        self.gen = 0
+        self.span = None  # (start, last analysed, running) of the analysis now
+        self.ended_at = None  # the analysis reached the end of the file here
+        self.seen = None  # (position, monotonic time, playing)
+        self.sent = []  # [(volume, monotonic time)]
+        self.sent_volume = None
+        self.last_send = 0.0
+        self.force = False
+        self.closed = False
+        self.error = None
+        threading.Thread(target=self._run, daemon=True, name="opuscast-leveler").start()
+
+    @staticmethod
+    def available():
+        return have("ffmpeg")
+
+    @property
+    def active(self):
+        return self.path is not None
+
+    # ---- what the window says
+    def follow(self, tv, path, start=0.0):
+        """Even out this file's sound from start seconds on (a new video or song)."""
+        with self.lock:
+            self._stop_analysis()
+            if tv is not self.tv:
+                old, base, gain = self.tv, self.base, self.curve.gain
+                if old is not None and base is not None and volume_for(base, gain) != base:
+                    threading.Thread(target=self._quietly_set, args=(old, base), daemon=True).start()
+                self.tv, self.base, self.sent_volume = tv, None, None
+            self.path, self.curve, self.seen, self.ended_at, self.error = path, LevelCurve(), None, None, None
+            self.force = True
+            self._analyse(max(0.0, float(start)))
+        self.wake.set()
+
+    def unfollow(self):
+        """Nothing to even out (stopped, a photo...): the user's volume goes back on the TV."""
+        with self.lock:
+            self._stop_analysis()
+            self.path = None
+            self.curve = LevelCurve()
+            self.force = True
+        self.wake.set()
+
+    def saw(self, pos, playing):
+        """The TV's position (seconds, None if it didn't say) and whether it's playing this."""
+        with self.lock:
+            now = time.monotonic()
+            if pos is None:
+                self.seen = None if not playing else self.seen
+                return
+            est = self._position(now)
+            pos = float(pos)
+            if playing and est is not None and 0 <= est - pos < 1.3:
+                pos = est  # TVs report whole seconds: keep the finer estimate
+            elif pos == int(pos) and playing:
+                pos += 0.5
+            self.seen = (pos, now, playing)
+
+    def observed(self, volume):
+        """The volume the TV reports. Returns the user's volume (what to show)."""
+        if volume is None:
+            return self.base
+        with self.lock:
+            now = time.monotonic()
+            self.sent = [(v, t) for v, t in self.sent if now - t < self.OWN]
+            if self.base is None:
+                self.base = volume
+            elif volume != self.sent_volume and all(volume != v for v, _t in self.sent):
+                # changed on the remote: that's the user's volume now, as it would be without the leveler
+                self.base = max(0, min(100, round(volume / 2 ** (self.curve.gain / 10))))
+                self.sent_volume = volume
+            return self.base
+
+    def set_base(self, volume):
+        """The user set this volume here."""
+        with self.lock:
+            self.base = max(0, min(100, int(volume)))
+            self.force = True
+        self.wake.set()
+
+    def close(self, restore=True, wait=False):
+        """Stop; with restore, the user's volume goes back on the TV (wait: before this returns)."""
+        with self.lock:
+            self._stop_analysis()
+            self.closed = True
+            tv, base, sent = self.tv, self.base, self.sent_volume
+        self.wake.set()
+        if restore and tv is not None and base is not None and sent != base:
+            if wait:
+                self._quietly_set(tv, base)
+            else:
+                threading.Thread(target=self._quietly_set, args=(tv, base), daemon=True).start()
+
+    @staticmethod
+    def _quietly_set(tv, volume):
+        try:
+            tv.set_volume(volume)
+        except TVError:
+            pass
+
+    # ---- inside
+    def _position(self, now):
+        if not self.seen:
+            return None
+        pos, at, playing = self.seen
+        return pos + min(now - at, 2.0) if playing else pos
+
+    def _analyse(self, start):
+        """ffmpeg's loudness meter over the file's (first) sound track from start on, as fast as it goes."""
+        self.gen += 1
+        gen, path, curve = self.gen, self.path, self.curve
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-ss", f"{start:.3f}",
+               "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", "aresample=24000,ebur128=framelog=info",
+               "-f", "null", "-"]
+        kw = {}
+        if sys.platform == "win32":
+            kw["creationflags"] = 0x08004000  # no console window, below normal priority
+        elif have("nice"):
+            cmd = ["nice", "-n", "10", *cmd]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1, **kw)
+        except OSError as e:
+            self.error = str(e)
+            return
+        self.proc, self.span = proc, (start, start, True)
+
+        def read():
+            last = start
+            for line in proc.stderr:
+                m = _LOUD_LINE.search(line)
+                if not m:
+                    continue
+                t = start + float(m.group(1)) - 0.2  # the middle of the 0.4 s window
+                with self.lock:
+                    if gen != self.gen:
+                        break
+                    curve.add(t, float(m.group(2)))
+                    last = t
+                    self.span = (start, t, True)
+            proc.wait()
+            with self.lock:
+                if gen == self.gen:
+                    self.span = (start, last, False)
+                    if proc.returncode == 0:
+                        self.ended_at = last
+                    elif last <= start:
+                        self.error = _("ffmpeg can't read this file's sound")
+        threading.Thread(target=read, daemon=True, name="opuscast-loudness").start()
+
+    def _stop_analysis(self):
+        self.gen += 1
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        self.proc, self.span = None, None
+
+    def _needs_analysis(self, pos):
+        """A seek outside what's read: read from there."""
+        if self.curve.covers(pos) or self.curve.covers(pos + 1) or self.error:
+            return False
+        if self.ended_at is not None and pos >= self.ended_at - 1:
+            return False  # past the end of the sound
+        if self.span:
+            start, last, running = self.span
+            if running and start - 1 <= pos and last < pos + 60:
+                return False  # it gets there in a moment
+        return True
+
+    def _run(self):
+        last = time.monotonic()
+        while True:
+            self.wake.wait(self.TICK)
+            self.wake.clear()
+            send = None
+            with self.lock:
+                if self.closed:
+                    return
+                now = time.monotonic()
+                dt, last = now - last, now
+                tv = self.tv
+                if tv is None:
+                    continue
+                need_base = self.base is None
+            if need_base:
+                try:
+                    v = tv.get_volume()
+                except TVError:
+                    v = None
+                with self.lock:
+                    if self.base is None and tv is self.tv and v is not None:
+                        self.base = self.sent_volume = v
+                if v is None:
+                    time.sleep(1)
+                    continue
+            with self.lock:
+                if self.closed or tv is not self.tv:
+                    continue
+                pos = self._position(now)
+                playing = bool(self.seen and self.seen[2])
+                if not self.active:
+                    self.curve.gain = 0.0
+                elif pos is not None and playing:
+                    if self._needs_analysis(pos):
+                        self._analyse(max(0.0, pos - 1))
+                    self.curve.step(pos, dt)
+                want = volume_for(self.base, self.curve.gain)
+                if want != self.sent_volume and (self.force or now - self.last_send >= self.MIN_GAP):
+                    send = want
+                    self.sent_volume, self.last_send = want, now
+                    self.sent.append((want, now))
+                self.force = False
+            if send is not None:
+                try:
+                    tv.set_volume(send)
+                except TVError:
+                    with self.lock:
+                        self.sent_volume = None  # try again next time
 
 
 def start_playback(tv, server, path, start_at=0, subtitle=None, subs_on=False):

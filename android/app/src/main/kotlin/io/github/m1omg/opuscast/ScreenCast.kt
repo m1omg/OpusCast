@@ -21,6 +21,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import androidx.annotation.RequiresApi
+import io.github.m1omg.opuscast.core.Compressor
 import io.github.m1omg.opuscast.core.LiveHub
 import io.github.m1omg.opuscast.core.TsMuxer
 import io.github.m1omg.opuscast.core.adtsHeader
@@ -43,6 +44,8 @@ class ScreenCast(
     /** 1080 or 720. */
     private val lines: Int,
     private val wantSound: Boolean,
+    /** Even out the sound on its way to the encoder (a compressor). */
+    private val even: Boolean,
     /** Android ended the capture (the "stop sharing" button), or an encoder died. On the main thread. */
     private val onStopped: (String?) -> Unit,
 ) {
@@ -251,11 +254,13 @@ class ScreenCast(
         var anchorUs = startUs
         var anchorFrame = 0L
         var lastAnchor = 0L
+        val compressor = if (even) Compressor(RATE, 2) else null
         try {
             while (running) {
                 val n = rec.read(pcm, 0, pcm.size)
                 if (n < 0) break
                 if (n == 0) continue
+                compressor?.process(pcm, n)
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastAnchor > 5000 && rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
                     lastAnchor = now

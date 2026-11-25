@@ -36,6 +36,11 @@ file to the TV over your Wi‑Fi (DLNA / UPnP), so the **TV remote works** for p
   With *Bring it back if the TV leaves* it comes back by itself; leave it again right away and it
   stays off. Only the TV you share to sees your screen
   there, and nobody watching for 30 minutes ends sharing.
+- **Even out the sound:** loud scenes quieter, quiet ones a little louder, without touching the
+  file. The phone reads the sound's loudness ahead (its own decoder, nothing is re-encoded) and rides
+  the TV's volume: down a moment before an explosion, slowly back up after it. Set the volume as usual
+  and that's the level it evens out around. Videos and songs; the shared screen's sound goes through a
+  compressor instead.
 - **The phone's volume buttons set the TV's volume** while something plays. Lock-screen and
   Bluetooth media controls work too.
 - **Device list:** shows which devices on your network can play video, which play music only, and

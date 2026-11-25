@@ -197,7 +197,12 @@ jobs:
       - name: Disk image
         run: |
           mkdir -p dmg && cp -R dist/OpusCast.app dmg/ && ln -s /Applications dmg/Applications
-          hdiutil create -volname OpusCast -srcfolder dmg -ov -format UDZO dist/OpusCast-macOS.dmg > /dev/null
+          # hdiutil sometimes says "Resource busy" on the runners: try again
+          for try in 1 2 3 4; do
+            hdiutil create -volname OpusCast -srcfolder dmg -ov -format UDZO dist/OpusCast-macOS.dmg > /dev/null && break
+            [ "$try" = 4 ] && exit 1
+            echo "::warning::hdiutil failed, trying again"; sleep 10
+          done
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:
