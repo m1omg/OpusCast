@@ -495,6 +495,7 @@ private fun OptionsBar(ui: UiState, engine: Engine) {
                 Toggle(stringResource(R.string.skynet_intro), ui.introOn) { engine.setIntro(it) }
                 Toggle(stringResource(R.string.screen_hd), ui.screenHd) { engine.setScreenHd(it) }
                 Toggle(stringResource(R.string.bring_back), ui.screenBringBack) { engine.setScreenBringBack(it) }
+                Toggle(stringResource(R.string.even_sound), ui.evenSound) { engine.setEvenSound(it) }
             }
             ui.introProgress?.let { p ->
                 Text(stringResource(R.string.preparing_intro_pct, (p * 100).toInt()), style = MaterialTheme.typography.bodySmall,

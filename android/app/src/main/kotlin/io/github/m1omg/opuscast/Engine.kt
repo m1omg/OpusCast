@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.LocaleList
 import io.github.m1omg.opuscast.core.Cancel
+import io.github.m1omg.opuscast.core.Leveler
 import io.github.m1omg.opuscast.core.Dlna
 import io.github.m1omg.opuscast.core.LiveHub
 import io.github.m1omg.opuscast.core.Media
@@ -129,6 +130,7 @@ data class UiState(
     val screenHd: Boolean = true,
     /** Screen casting: show it on the TV again by itself when the TV leaves it. */
     val screenBringBack: Boolean = false,
+    val evenSound: Boolean = false,
 )
 
 /** Position on the TV, ticking 4 times a second (estimated between the TV's answers). */
@@ -218,6 +220,8 @@ class Engine(private val app: Context) {
     private var volume: Int? = null
     private var volTouched = 0.0
     private var volumeTask: Runnable? = null
+    /** Evens out the sound by the TV's volume (made when first needed). */
+    private var leveler: Leveler? = null
     private var lastSave = 0.0
     private var pollErrors = 0
     private var devices = listOf<NetDevice>()
@@ -327,6 +331,7 @@ class Engine(private val app: Context) {
             previewOn = settings.preview, introOn = settings.intro, introProgress = introProgress,
             sessionActive = s != null || (pl != null && page == Page.PLAYER), musicOnly = musicOnly, screenHd = settings.screenHd,
             screenBringBack = settings.screenBringBack,
+            evenSound = settings.evenSound,
         )
     }
 
@@ -609,7 +614,7 @@ class Engine(private val app: Context) {
         }
         val changes = parseLastChange(body) ?: return
         val t = now()
-        changes["Volume"]?.toIntOrNull()?.let { if (t - volTouched > 3) { volume = it; publish() } }
+        changes["Volume"]?.toIntOrNull()?.let { if (t - volTouched > 3) { volume = shownVolume(it); publish() } }
         val s = session
         if ("X_EnabledCaptions" in changes) {
             lastCaptionEvent = t
@@ -1094,7 +1099,7 @@ class Engine(private val app: Context) {
         val sound = Build.VERSION.SDK_INT >= 29 &&
             app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         var cast: ScreenCast? = null
-        val created = ScreenCast(app, projection, hub, if (settings.screenHd) 1080 else 720, sound) { why ->
+        val created = ScreenCast(app, projection, hub, if (settings.screenHd) 1080 else 720, sound, settings.evenSound) { why ->
             if (screen === cast) {
                 endSession(stopTv = true)
                 if (why != null) showInfo(str(R.string.screen_failed, why), Banner.Kind.WARNING)
@@ -1124,6 +1129,28 @@ class Engine(private val app: Context) {
     val screenActive: Boolean get() = screen != null
     /** The TV left the shared screen (it's still shared): [showScreenAgain] brings it back. */
     val screenAway: Boolean get() = session?.watch?.away == true
+
+    /** Even out the sound: videos and songs by the TV's volume (their loudness read ahead, nothing
+     *  re-encoded), the phone's screen with a compressor (from the next time it's cast). */
+    fun setEvenSound(on: Boolean) {
+        settings.evenSound = on
+        save()
+        if (on && session?.kind == Kind.SCREEN) showInfo(str(R.string.even_screen_next_time))
+        levelFollow(estPos())
+        publish()
+    }
+
+    /** Even out what plays now (videos and songs), or let go of the TV's volume. */
+    private fun levelFollow(start: Double? = null) {
+        val s = session
+        val t = tv
+        if (s != null && t != null && settings.evenSound && (s.kind == Kind.MOVIE || s.kind == Kind.MUSIC)) {
+            val lev = leveler ?: Leveler(DecodedLoudness(app)).also { leveler = it }
+            lev.follow(t, s.video.ref, start ?: s.startAt)
+        } else {
+            leveler?.unfollow()
+        }
+    }
 
     fun setScreenBringBack(on: Boolean) {
         settings.screenBringBack = on
@@ -1270,6 +1297,7 @@ class Engine(private val app: Context) {
         if (subsOn) lastCaptionCmd = start
         if (eventSids.isEmpty() && !eventsPending) subscribeEvents(t) // e.g. the TV didn't answer until it was allowed
         startOnTv(s)
+        levelFollow()
         main.postDelayed({ checkFetched(g) }, 15_000)
         if (kind == Kind.MOVIE && found == null) {
             thread(isDaemon = true, name = "opuscast-subs") {
@@ -1464,7 +1492,7 @@ class Engine(private val app: Context) {
         }
         if (pollErrors >= 3) statusLine = str(R.string.connected_to, t.name)
         pollErrors = 0
-        if (r.volume != null && now() - volTouched > 3) volume = r.volume
+        if (r.volume != null && now() - volTouched > 3) volume = shownVolume(r.volume)
         val s = session
         if (s == null) {
             publish()
@@ -1493,6 +1521,7 @@ class Engine(private val app: Context) {
                 tvState = state
             }
         }
+        leveler?.saw(if (ours) pos?.toDouble() else null, ours && state == "PLAYING" && s.seenPlaying)
         hold?.let { h ->
             val arrived = ours && pos != null && s.seenPlaying && pos >= h.target - 2 && pos <= h.target + 8
             if (arrived || n - h.since > h.limit) hold = null
@@ -1607,6 +1636,7 @@ class Engine(private val app: Context) {
         poller.active = false
         gen += 1
         s.subCancel?.cancelled = true
+        leveler?.unfollow() // the user's volume back on the TV
         if (s.kind == Kind.SCREEN) stopScreen()
         s.source?.let { src -> thread(isDaemon = true, name = "opuscast-source-stop") { src.close() } }
         sourceLock?.let { runCatching { it.release() } }
@@ -1933,11 +1963,16 @@ class Engine(private val app: Context) {
         val task = Runnable {
             volumeTask = null
             val v = volume ?: return@Runnable
-            submit({ t.setVolume(v) })
+            val lev = leveler
+            if (lev != null && lev.active) lev.setBase(v) // the level it evens out around
+            else submit({ t.setVolume(v) })
         }
         volumeTask = task
         main.postDelayed(task, 150)
     }
+
+    /** The TV's volume - or, while the sound is evened out, the user's own (the TV's follows the sound). */
+    private fun shownVolume(tvVolume: Int): Int = leveler?.observed(tvVolume) ?: tvVolume
 
     fun volumeStep(delta: Int) {
         setVolume((volume ?: 10) + delta)

@@ -21,6 +21,8 @@ class Settings(
     var screenBringBack: Boolean = false,
     /** OpusCast's identity among the TV's sources: the same each time, so the TV knows it again. */
     var sourceId: String? = null,
+    /** Even out the sound: the TV's volume follows the loudness (videos, songs; the screen: a compressor). */
+    var evenSound: Boolean = false,
 )
 
 /** Settings as JSON in the app's private files (like ~/.config/opuscast/config.json on Linux). */
@@ -40,7 +42,7 @@ class Store(dir: File) {
         Settings(tv?.optString("location")?.ifEmpty { null }, tv?.optString("name")?.ifEmpty { null },
             o.optBoolean("preview", false), o.optBoolean("intro", false), RecentList(recent),
             o.optInt("slide_seconds", 5), o.optBoolean("screen_hd", true), o.optBoolean("screen_bring_back", false),
-            o.optString("source_id").ifEmpty { null })
+            o.optString("source_id").ifEmpty { null }, o.optBoolean("even_sound", false))
     } catch (e: Exception) {
         Settings()
     }
@@ -53,6 +55,7 @@ class Store(dir: File) {
         o.put("slide_seconds", s.slideSeconds)
         o.put("screen_hd", s.screenHd)
         o.put("screen_bring_back", s.screenBringBack)
+        o.put("even_sound", s.evenSound)
         if (s.sourceId != null) o.put("source_id", s.sourceId)
         o.put("recent", JSONArray().apply {
             for (r in s.recent.items) put(JSONObject().put("ref", r.ref).put("name", r.name).put("pos", r.pos)

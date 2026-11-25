@@ -168,4 +168,7 @@
     <string name="screen_back_hint">On the TV: choose “%1$s” in its sources to go back.</string>
     <string name="screen_source_hint">Left it on the TV by mistake? Choose “%1$s” in the TV\'s sources to go back.</string>
     <string name="bring_back">Bring it back if the TV leaves</string>
+    <!-- evening out the sound: the TV's volume follows the loudness, read ahead (nothing re-encoded) -->
+    <string name="even_sound">Even out the sound</string>
+    <string name="even_screen_next_time">The phone\'s sound is evened out from the next time you cast the screen.</string>
 </resources>
