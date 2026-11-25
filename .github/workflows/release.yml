@@ -14,6 +14,10 @@ jobs:
   android:
     uses: ./.github/workflows/android.yml
     secrets: inherit
+    # android.yml's own "release" job (for releases drafted on GitHub) asks for this; it's skipped
+    # here, but GitHub checks it before running anything
+    permissions:
+      contents: write
 
   desktop:
     uses: ./.github/workflows/desktop.yml
